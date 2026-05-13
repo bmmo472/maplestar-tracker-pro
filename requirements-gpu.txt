@@ -1,0 +1,19 @@
+# GPU 版執行依賴
+#
+# ⚠ paddlepaddle-gpu 不在此 requirements 裡，避免 pip 抓到 CPU 版！
+# 請用 build_windows_gpu.ps1 自動安裝，或手動：
+#
+#     pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+#
+# CUDA 與 index 對應（Windows）：
+#     CUDA 11.8 → cu118
+#     CUDA 12.6 → cu126
+#     CUDA 12.9 → cu129  ← 目前最高，CUDA 13.x 驅動也用這個（向下相容）
+
+PySide6==6.7.3
+mss==9.0.2
+Pillow==10.4.0
+numpy>=1.24,<2.4
+opencv-contrib-python==4.10.0.84
+pywinctl==0.4.1
+paddleocr==3.5.0
