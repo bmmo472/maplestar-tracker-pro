@@ -1,19 +1,21 @@
 """懸浮視窗 — 顯示即時速率與升級 ETA。
 
 特性：
-- 永遠最上層（Qt.WindowStaysOnTopHint）
+- 永遠最上層
 - 無邊框可拖動
-- 可調透明度（70-100%）
-- 右鍵選單調整透明度與關閉
+- 右下角 size grip 拖拉調整大小
+- 右鍵選單調整透明度 / 預設尺寸 / 關閉
+- 性能優化：狀態用 dynamic property 切換避免每秒 restyle
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QAction, QCursor, QMouseEvent
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QAction, QCursor, QMouseEvent, QResizeEvent
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMenu, QProgressBar, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QMenu, QProgressBar, QSizeGrip,
+    QVBoxLayout, QWidget,
 )
 
 from .styles import COLORS
@@ -58,7 +60,9 @@ def _format_num(n: Optional[int | float]) -> str:
 
 
 class FloatingWindow(QWidget):
-    """精簡浮動視窗：等級 / 進度 / 1m·5m·10m 速率 / ETA / 累計時間 / 累積 EXP。"""
+    """精簡浮動視窗，可調大小，性能優化。"""
+
+    resized = Signal(int, int)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -68,15 +72,22 @@ class FloatingWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.setFixedWidth(240)
+
+        # 可調大小
+        self.setMinimumSize(180, 220)
+        self.setMaximumSize(600, 800)
+        self.resize(240, 380)
+
         self._opacity = 0.92
         self.setWindowOpacity(self._opacity)
         self._drag_offset: Optional[QPoint] = None
+        self._last_tracking: Optional[bool] = None  # 狀態切換 cache，避免重複 polish
 
         self._build_ui()
 
     def _build_ui(self) -> None:
         c = COLORS
+        # 用 dynamic property [live=true/false] 切換顏色，不改 objectName
         self.setStyleSheet(f"""
             QWidget#float_root {{
                 background-color: {c['panel']};
@@ -93,11 +104,11 @@ class FloatingWindow(QWidget):
                 font-size: 10px;
                 letter-spacing: 1px;
             }}
-            QLabel#float_status {{
+            QLabel#float_status[live="false"] {{
                 color: {c['fg_muted']};
                 font-size: 10px;
             }}
-            QLabel#float_status_live {{
+            QLabel#float_status[live="true"] {{
                 color: {c['success']};
                 font-size: 10px;
                 font-weight: bold;
@@ -159,77 +170,94 @@ class FloatingWindow(QWidget):
                 background-color: {c['accent']};
                 border-radius: 2px;
             }}
+            QSizeGrip {{
+                background: transparent;
+                width: 14px;
+                height: 14px;
+            }}
         """)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         root = QFrame(self)
         root.setObjectName("float_root")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(root)
 
         layout = QVBoxLayout(root)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(6)
 
-        # 標題列
-        title_row = QHBoxLayout()
-        title_row.setSpacing(6)
-        self._title_lbl = QLabel("MAPLESTAR")
-        self._title_lbl.setObjectName("float_title")
+        # Header
+        header = QHBoxLayout()
+        title_lbl = QLabel("MapleStar")
+        title_lbl.setObjectName("float_title")
         self._status_lbl = QLabel("待命")
         self._status_lbl.setObjectName("float_status")
-        title_row.addWidget(self._title_lbl)
-        title_row.addStretch(1)
-        title_row.addWidget(self._status_lbl)
-        layout.addLayout(title_row)
+        self._status_lbl.setProperty("live", "false")
+        header.addWidget(title_lbl)
+        header.addStretch(1)
+        header.addWidget(self._status_lbl)
+        layout.addLayout(header)
 
         # 等級 + 百分比
-        lvl_row = QHBoxLayout()
-        lvl_row.setSpacing(8)
+        lv_row = QHBoxLayout()
         self._lvl_lbl = QLabel("Lv —")
         self._lvl_lbl.setObjectName("float_lvl")
         self._pct_lbl = QLabel("—")
         self._pct_lbl.setObjectName("float_pct")
-        self._pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lvl_row.addWidget(self._lvl_lbl)
-        lvl_row.addStretch(1)
-        lvl_row.addWidget(self._pct_lbl)
-        layout.addLayout(lvl_row)
+        self._pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        lv_row.addWidget(self._lvl_lbl)
+        lv_row.addStretch(1)
+        lv_row.addWidget(self._pct_lbl)
+        layout.addLayout(lv_row)
 
         # 進度條
         self._progress = QProgressBar()
         self._progress.setRange(0, 10000)
         self._progress.setValue(0)
+        self._progress.setTextVisible(False)
         layout.addWidget(self._progress)
 
-        # 速率區
+        # 速率
         layout.addSpacing(2)
-        self._rate_1m_lbl = self._add_row(layout, "1 分", primary=True)
-        self._rate_5m_lbl = self._add_row(layout, "5 分")
-        self._rate_10m_lbl = self._add_row(layout, "10 分")
+        self._rate_1m_lbl = self._add_row(layout, "1 分速率", primary=True)
+        self._rate_5m_lbl = self._add_row(layout, "5 分預估")
+        self._rate_10m_lbl = self._add_row(layout, "10 分預估")
 
-        # 分隔線
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet(f"color: {COLORS['border']}; background-color: {COLORS['border']}; max-height: 1px;")
-        layout.addWidget(line)
+        layout.addSpacing(2)
+        self._eta_lbl = self._add_row(layout, "升下一級", value_object="float_eta_value")
+        self._elapsed_lbl = self._add_row(layout, "累計", value_object="float_elapsed_value")
+        self._total_lbl = self._add_row(layout, "累積 EXP", value_object="float_total_value")
 
-        self._eta_lbl = self._add_row(layout, "升下一級", value_obj="float_eta_value")
-        self._elapsed_lbl = self._add_row(layout, "本次累計", value_obj="float_elapsed_value")
-        self._total_lbl = self._add_row(layout, "累積 EXP", value_obj="float_total_value")
+        layout.addStretch(1)
 
-    def _add_row(self, layout: QVBoxLayout, label_text: str,
-                 primary: bool = False, value_obj: Optional[str] = None) -> QLabel:
+        # Size Grip
+        grip_row = QHBoxLayout()
+        grip_row.setContentsMargins(0, 0, 0, 0)
+        grip_row.addStretch(1)
+        self._size_grip = QSizeGrip(root)
+        grip_row.addWidget(
+            self._size_grip, 0,
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+        )
+        layout.addLayout(grip_row)
+
+    def _add_row(self, layout: QVBoxLayout, label_text: str, *,
+                 primary: bool = False,
+                 value_object: Optional[str] = None) -> QLabel:
         row = QHBoxLayout()
-        row.setSpacing(8)
         lbl = QLabel(label_text)
         lbl.setObjectName("float_rate_label")
         value = QLabel("—")
-        if value_obj:
-            value.setObjectName(value_obj)
+        if value_object:
+            value.setObjectName(value_object)
+        elif primary:
+            value.setObjectName("float_rate_value_primary")
         else:
-            value.setObjectName("float_rate_value_primary" if primary else "float_rate_value")
-        value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value.setObjectName("float_rate_value")
+        value.setAlignment(Qt.AlignmentFlag.AlignRight)
         row.addWidget(lbl)
         row.addStretch(1)
         row.addWidget(value)
@@ -251,6 +279,10 @@ class FloatingWindow(QWidget):
         self._drag_offset = None
         event.accept()
 
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.resized.emit(self.width(), self.height())
+
     # ===== 右鍵選單 =====
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
@@ -270,6 +302,19 @@ class FloatingWindow(QWidget):
             act = QAction(f"{pct}%", self)
             act.triggered.connect(lambda _checked=False, p=pct: self.set_opacity(p / 100.0))
             opacity_menu.addAction(act)
+
+        size_menu = menu.addMenu("尺寸預設")
+        for label, w, h in (
+            ("迷你 (200×280)", 200, 280),
+            ("小 (240×380)", 240, 380),
+            ("中 (320×460)", 320, 460),
+            ("大 (420×560)", 420, 560),
+        ):
+            act = QAction(label, self)
+            act.triggered.connect(
+                lambda _checked=False, ww=w, hh=h: self.resize(ww, hh)
+            )
+            size_menu.addAction(act)
 
         menu.addSeparator()
         close_action = menu.addAction("關閉懸浮視窗")
@@ -297,14 +342,17 @@ class FloatingWindow(QWidget):
                     elapsed_seconds: float,
                     total_gained: Optional[int],
                     tracking: bool) -> None:
-        # 狀態
-        if tracking:
-            self._status_lbl.setText("追蹤中")
-            self._status_lbl.setObjectName("float_status_live")
-        else:
-            self._status_lbl.setText("待命")
-            self._status_lbl.setObjectName("float_status")
-        self._status_lbl.setStyleSheet(self._status_lbl.styleSheet())
+        # 狀態：只在變化時 polish，不每秒重 polish
+        if tracking != self._last_tracking:
+            self._last_tracking = tracking
+            if tracking:
+                self._status_lbl.setText("追蹤中")
+                self._status_lbl.setProperty("live", "true")
+            else:
+                self._status_lbl.setText("待命")
+                self._status_lbl.setProperty("live", "false")
+            self._status_lbl.style().unpolish(self._status_lbl)
+            self._status_lbl.style().polish(self._status_lbl)
 
         # 等級
         if level is None:
@@ -321,10 +369,16 @@ class FloatingWindow(QWidget):
             self._pct_lbl.setText("—")
             self._progress.setValue(0)
 
-        # 速率
+        # 1 分速率（即時，由 main_window 傳入滾動值）
         self._rate_1m_lbl.setText(_format_rate(rate_1m))
-        self._rate_5m_lbl.setText(_format_rate(rate_5m))
-        self._rate_10m_lbl.setText(_format_rate(rate_10m))
+
+        # 5 / 10 分推估（用 1m 推估累積總量）
+        if rate_1m and rate_1m > 0:
+            self._rate_5m_lbl.setText(f"~{_format_num(rate_1m * 5)}")
+            self._rate_10m_lbl.setText(f"~{_format_num(rate_1m * 10)}")
+        else:
+            self._rate_5m_lbl.setText("—")
+            self._rate_10m_lbl.setText("—")
 
         # ETA / 累計 / 累積
         self._eta_lbl.setText(_format_eta(eta_seconds))

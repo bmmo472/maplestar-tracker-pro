@@ -28,7 +28,7 @@ from .styles import COLORS, stylesheet
 
 SAMPLE_INTERVAL_OPTIONS: tuple[float, ...] = (0.5, 1, 2, 3, 5, 10)
 APP_TITLE = "MapleStar Tracker Pro"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 AUTHOR = "土豆地雷"
 COPYRIGHT = f"© 2026 {AUTHOR}"
 
@@ -44,22 +44,29 @@ def _asset_path(filename: str) -> Path:
 
 class _Worker(QObject):
     """背景擷取 + OCR 執行緒；用 signal 把結果送回 UI thread。"""
-    result_ready = Signal(object)
+    result_ready = Signal(object)            # OCRResult (EXP)
+    level_result_ready = Signal(object)      # Optional[int] (Level OCR)
     error_occurred = Signal(str)
 
     def __init__(self, window_info: capture.WindowInfo,
-                 roi: tuple[int, int, int, int], interval: float):
+                 roi: tuple[int, int, int, int], interval: float,
+                 level_roi: Optional[tuple[int, int, int, int]] = None):
         super().__init__()
         self._win = window_info
         self._roi = roi
+        self._level_roi = level_roi
         self._interval = interval
         self._running = False
+        self._tick = 0
 
     def set_interval(self, seconds: float) -> None:
         self._interval = float(seconds)
 
     def set_roi(self, roi: tuple[int, int, int, int]) -> None:
         self._roi = roi
+
+    def set_level_roi(self, level_roi: Optional[tuple[int, int, int, int]]) -> None:
+        self._level_roi = level_roi
 
     def stop(self) -> None:
         self._running = False
@@ -76,6 +83,14 @@ class _Worker(QObject):
                     else:
                         result = ocr.recognize(img)
                         self.result_ready.emit(result)
+
+                    # 等級 OCR — 每 3 個 tick 才跑一次省 CPU
+                    if self._level_roi is not None and self._tick % 3 == 0:
+                        lvl_img = capture.grab_window_roi(self._win, *self._level_roi, sct=sct)
+                        if lvl_img is not None:
+                            lvl = ocr.recognize_level(lvl_img)
+                            self.level_result_ready.emit(lvl)
+                    self._tick += 1
                 except Exception as e:
                     self.error_occurred.emit(str(e))
                 wait_until = start + self._interval
@@ -111,6 +126,22 @@ def _make_metric(parent: QWidget, label_text: str,
     return container, value
 
 
+def _make_stat(parent: QWidget, label_text: str,
+               value_obj: str = "stat_value") -> tuple[QWidget, QLabel]:
+    """新版資訊條的單位元 — label 在上、value 在下，緊湊垂直布局。"""
+    container = QWidget(parent)
+    v = QVBoxLayout(container)
+    v.setContentsMargins(14, 12, 14, 12)
+    v.setSpacing(4)
+    lbl = QLabel(label_text.upper())
+    lbl.setObjectName("stat_label")
+    value = QLabel("—")
+    value.setObjectName(value_obj)
+    v.addWidget(lbl)
+    v.addWidget(value)
+    return container, value
+
+
 def _format_eta(seconds: Optional[float]) -> str:
     if seconds is None or seconds <= 0:
         return "—"
@@ -128,6 +159,20 @@ def _format_num(n: Optional[int | float]) -> str:
     if n is None:
         return "—"
     return f"{int(n):,}"
+
+
+def _format_compact(n: Optional[int | float]) -> str:
+    """大數字精簡格式化 — K / M / B。"""
+    if n is None:
+        return "—"
+    n = int(n)
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return f"{n:,}"
 
 
 class MainWindow(QMainWindow):
@@ -150,6 +195,7 @@ class MainWindow(QMainWindow):
         self._windows: list[capture.WindowInfo] = []
         self._selected_window: Optional[capture.WindowInfo] = None
         self._roi: Optional[tuple[int, int, int, int]] = None
+        self._level_roi: Optional[tuple[int, int, int, int]] = None
         self._interval = 1.0
         self._settings = settings_mod.load()
         self._session_start: Optional[float] = None
@@ -189,7 +235,6 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_tracker_tab(), "即時追蹤")
         tabs.addTab(self._build_setup_tab(), "設定")
-        tabs.addTab(self._build_diag_tab(), "OCR 診斷")
         root.addWidget(tabs, 1)
 
         status_bar = QStatusBar()
@@ -223,8 +268,8 @@ class MainWindow(QMainWindow):
         title_box.setSpacing(0)
         title = QLabel(APP_TITLE)
         title.setObjectName("title")
-        subtitle = QLabel(f"v{APP_VERSION}  ·  即時辨識經驗值、追蹤效率與升等進度")
-        subtitle.setObjectName("subtitle")
+        subtitle = QLabel(f"v{APP_VERSION}  ·  {AUTHOR} 出品")
+        subtitle.setObjectName("version_line")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         layout.addLayout(title_box, 1)
@@ -254,15 +299,18 @@ class MainWindow(QMainWindow):
         return layout
 
     def _build_tracker_tab(self) -> QWidget:
+        from PySide6.QtWidgets import QProgressBar  # 延後 import 維持原本 imports 整潔
         page = QWidget()
-        layout = QGridLayout(page)
-        layout.setContentsMargins(8, 12, 8, 8)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(12)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        ctrl_card, ctrl_layout = _make_card(page, "")
+        # ── 控制列（緊貼頂部、無邊框）──
+        ctrl_strip = QFrame(page)
+        ctrl_strip.setObjectName("strip_thin")
+        ctrl_layout = QHBoxLayout(ctrl_strip)
+        ctrl_layout.setContentsMargins(14, 10, 14, 10)
         ctrl_layout.setSpacing(8)
-        ctrl_row = QHBoxLayout()
         self._start_btn = QPushButton("開始追蹤")
         self._start_btn.setObjectName("primary")
         self._start_btn.clicked.connect(self._start_tracking)
@@ -270,78 +318,108 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_tracking)
         self._reset_btn = QPushButton("重置")
+        self._reset_btn.setObjectName("danger")
         self._reset_btn.clicked.connect(self._reset_tracking)
-        ctrl_row.addWidget(self._start_btn)
-        ctrl_row.addWidget(self._stop_btn)
-        ctrl_row.addWidget(self._reset_btn)
-        ctrl_row.addStretch(1)
-        ctrl_layout.addLayout(ctrl_row)
-        layout.addWidget(ctrl_card, 0, 0, 1, 2)
+        ctrl_layout.addWidget(self._start_btn)
+        ctrl_layout.addWidget(self._stop_btn)
+        ctrl_layout.addWidget(self._reset_btn)
+        ctrl_layout.addStretch(1)
+        layout.addWidget(ctrl_strip)
 
-        cur_card, cur_layout = _make_card(page, "目前狀態")
-        cur_grid = QGridLayout()
-        cur_grid.setSpacing(8)
-        cur_value_box = QVBoxLayout()
-        l1 = QLabel("目前 EXP")
-        l1.setObjectName("metric_label")
+        # ── 等級 + 進度 strip ──
+        lv_strip = QFrame(page)
+        lv_strip.setObjectName("strip")
+        lv_box = QVBoxLayout(lv_strip)
+        lv_box.setContentsMargins(20, 16, 20, 14)
+        lv_box.setSpacing(6)
+
+        # 上排：Lv | pct
+        top_row = QHBoxLayout()
+        lv_label_box = QVBoxLayout()
+        lv_label_box.setSpacing(2)
+        lv_l1 = QLabel("LEVEL")
+        lv_l1.setObjectName("stat_label")
+        self._level_value = QLabel("—")
+        self._level_value.setObjectName("level_value")
+        lv_label_box.addWidget(lv_l1)
+        lv_label_box.addWidget(self._level_value)
+        top_row.addLayout(lv_label_box)
+
+        top_row.addStretch(1)
+
+        pct_label_box = QVBoxLayout()
+        pct_label_box.setSpacing(2)
+        pct_l1 = QLabel("PROGRESS")
+        pct_l1.setObjectName("stat_label")
+        pct_l1.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._pct_value = QLabel("—")
+        self._pct_value.setObjectName("pct_value")
+        self._pct_value.setAlignment(Qt.AlignmentFlag.AlignRight)
+        pct_label_box.addWidget(pct_l1)
+        pct_label_box.addWidget(self._pct_value)
+        top_row.addLayout(pct_label_box)
+        lv_box.addLayout(top_row)
+
+        # 細進度條
+        self._hero_bar = QProgressBar()
+        self._hero_bar.setObjectName("hero_bar")
+        self._hero_bar.setRange(0, 10000)
+        self._hero_bar.setValue(0)
+        self._hero_bar.setTextVisible(False)
+        lv_box.addWidget(self._hero_bar)
+        layout.addWidget(lv_strip)
+
+        # ── HERO：目前 EXP 巨大字 ──
+        hero_strip = QFrame(page)
+        hero_strip.setObjectName("strip_hero")
+        hero_layout = QVBoxLayout(hero_strip)
+        hero_layout.setContentsMargins(20, 28, 20, 28)
+        hero_layout.setSpacing(4)
+        hero_label = QLabel("CURRENT EXP")
+        hero_label.setObjectName("hero_label")
+        hero_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._cur_exp_lbl = QLabel("—")
-        self._cur_exp_lbl.setObjectName("metric_value")
-        cur_value_box.addWidget(l1)
-        cur_value_box.addWidget(self._cur_exp_lbl)
-        cur_grid.addLayout(cur_value_box, 0, 0, 1, 4)
+        self._cur_exp_lbl.setObjectName("hero_value")
+        self._cur_exp_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hero_layout.addWidget(hero_label)
+        hero_layout.addWidget(self._cur_exp_lbl)
+        layout.addWidget(hero_strip)
 
-        lvl_container, self._level_value = _make_metric(page, "目前等級")
-        pct_container, self._pct_value = _make_metric(page, "進度")
-        elapsed_container, self._elapsed_value = _make_metric(page, "累計時間")
-        total_container, self._total_value = _make_metric(page, "本次累積 EXP")
-        cur_grid.addWidget(lvl_container, 1, 0)
-        cur_grid.addWidget(pct_container, 1, 1)
-        cur_grid.addWidget(elapsed_container, 1, 2)
-        cur_grid.addWidget(total_container, 1, 3)
-        cur_layout.addLayout(cur_grid)
-        layout.addWidget(cur_card, 1, 0, 1, 2)
+        # ── 二級資訊條（5 個欄位橫向）──
+        stats_strip = QFrame(page)
+        stats_strip.setObjectName("strip")
+        stats_layout = QHBoxLayout(stats_strip)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(0)
 
-        rate_card, rate_layout = _make_card(page, "經驗速率")
-        rate_grid = QGridLayout()
-        rate_grid.setSpacing(10)
-        primary_box = QVBoxLayout()
-        l_primary = QLabel("近 1 分速率（即時）")
-        l_primary.setObjectName("metric_label")
-        self._rate_1m_lbl = QLabel("—")
-        self._rate_1m_lbl.setObjectName("rate_primary")
-        primary_box.addWidget(l_primary)
-        primary_box.addWidget(self._rate_1m_lbl)
-        rate_grid.addLayout(primary_box, 0, 0, 1, 3)
+        elapsed_c, self._elapsed_value = _make_stat(page, "累計時間")
+        total_c, self._total_value = _make_stat(page, "本次累積", "stat_value_accent")
+        eta_c, self._eta_level_lbl = _make_stat(page, "升下一級", "stat_value_warn")
+        rem_c, self._remaining_exp_lbl = _make_stat(page, "剩餘 EXP")
+        state_c, self._sample_state_lbl = _make_stat(page, "辨識狀態")
 
-        rate5_container, self._rate_5m_lbl = _make_metric(page, "近 5 分速率")
-        rate10_container, self._rate_10m_lbl = _make_metric(page, "近 10 分速率")
-        rate30_container, self._rate_30m_lbl = _make_metric(page, "近 30 分速率")
-        rateavg_container, self._rate_avg_lbl = _make_metric(page, "本次平均")
-        rate_grid.addWidget(rate5_container, 1, 0)
-        rate_grid.addWidget(rate10_container, 1, 1)
-        rate_grid.addWidget(rate30_container, 1, 2)
-        rate_grid.addWidget(rateavg_container, 2, 0)
-        rate_layout.addLayout(rate_grid)
-        layout.addWidget(rate_card, 2, 0, 1, 2)
+        for w in (elapsed_c, total_c, eta_c, rem_c, state_c):
+            stats_layout.addWidget(w, 1)
+        layout.addWidget(stats_strip)
 
-        eta_card, eta_layout = _make_card(page, "升級預估")
-        eta_grid = QGridLayout()
-        eta_grid.setSpacing(10)
-        eta_container, self._eta_level_lbl = _make_metric(page, "升下一級")
-        self._eta_level_lbl.setObjectName("metric_value")
-        rem_container, self._remaining_exp_lbl = _make_metric(page, "剩餘 EXP")
-        state_container, self._sample_state_lbl = _make_metric(page, "辨識狀態")
-        eta_grid.addWidget(eta_container, 0, 0)
-        eta_grid.addWidget(rem_container, 1, 0)
-        eta_grid.addWidget(state_container, 2, 0)
-        eta_layout.addLayout(eta_grid)
-        eta_layout.addStretch(1)
-        layout.addWidget(eta_card, 0, 2, 3, 1)
+        # ── 速率資訊條（第二行）──
+        rates_strip = QFrame(page)
+        rates_strip.setObjectName("strip_thin")
+        rates_layout = QHBoxLayout(rates_strip)
+        rates_layout.setContentsMargins(0, 0, 0, 0)
+        rates_layout.setSpacing(0)
 
-        layout.setColumnStretch(0, 1)
-        layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(2, 1)
-        layout.setRowStretch(2, 1)
+        rate1_c, self._rate_1m_lbl = _make_stat(page, "1 分速率", "stat_value_accent")
+        rate5r_c, self._rate_5m_real_lbl = _make_stat(page, "5 分累積", "stat_value_accent")
+        rate5p_c, self._rate_5m_proj_lbl = _make_stat(page, "5 分推估")
+        rate10r_c, self._rate_10m_real_lbl = _make_stat(page, "10 分累積", "stat_value_accent")
+        rate10p_c, self._rate_10m_proj_lbl = _make_stat(page, "10 分推估")
+
+        for w in (rate1_c, rate5r_c, rate5p_c, rate10r_c, rate10p_c):
+            rates_layout.addWidget(w, 1)
+        layout.addWidget(rates_strip)
+
+        layout.addStretch(1)
         return page
 
     def _build_setup_tab(self) -> QWidget:
@@ -373,6 +451,18 @@ class MainWindow(QMainWindow):
         roi_row.addWidget(pick_btn)
         roi_layout.addLayout(roi_row)
         layout.addWidget(roi_card)
+
+        lvl_roi_card, lvl_roi_layout = _make_card(page, "等級區域（OCR 自動辨識）")
+        self._level_roi_label = QLabel("尚未設定（保留則用手動 / 自動推算）")
+        self._level_roi_label.setStyleSheet(f"color: {COLORS['fg_muted']};")
+        lvl_roi_row = QHBoxLayout()
+        lvl_roi_row.addWidget(self._level_roi_label, 1)
+        lvl_pick_btn = QPushButton("框選等級區域")
+        lvl_pick_btn.setObjectName("primary")
+        lvl_pick_btn.clicked.connect(self._pick_level_region)
+        lvl_roi_row.addWidget(lvl_pick_btn)
+        lvl_roi_layout.addLayout(lvl_roi_row)
+        layout.addWidget(lvl_roi_card)
 
         calib_card, calib_layout = _make_card(page, "校正")
         calib_row = QHBoxLayout()
@@ -437,57 +527,35 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return page
 
-    def _build_diag_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 12, 8, 8)
-        layout.setSpacing(12)
-
-        stat_card, stat_layout = _make_card(page, "統計")
-        stat_grid = QGridLayout()
-        stat_grid.setSpacing(10)
-        c1, self._stat_capture_lbl = _make_metric(page, "取樣次數")
-        c2, self._stat_ok_lbl = _make_metric(page, "成功辨識")
-        c3, self._stat_ignored_lbl = _make_metric(page, "已忽略")
-        c4, self._stat_levelup_lbl = _make_metric(page, "升級次數")
-        stat_grid.addWidget(c1, 0, 0)
-        stat_grid.addWidget(c2, 0, 1)
-        stat_grid.addWidget(c3, 0, 2)
-        stat_grid.addWidget(c4, 0, 3)
-        stat_layout.addLayout(stat_grid)
-        layout.addWidget(stat_card)
-
-        last_card, last_layout = _make_card(page, "最後一次 OCR")
-        self._last_ocr_text = QTextEdit()
-        self._last_ocr_text.setReadOnly(True)
-        self._last_ocr_text.setMaximumHeight(180)
-        self._last_ocr_text.setPlaceholderText("尚未取樣")
-        last_layout.addWidget(self._last_ocr_text)
-        layout.addWidget(last_card)
-
-        corr_card, corr_layout = _make_card(page, "修正記錄")
-        self._corrections_text = QTextEdit()
-        self._corrections_text.setReadOnly(True)
-        self._corrections_text.setPlaceholderText("尚無修正")
-        corr_layout.addWidget(self._corrections_text)
-        layout.addWidget(corr_card, 1)
-        return page
-
     # ===== 控制邏輯 =====
     def _refresh_windows(self) -> None:
-        self._windows = capture.list_windows()
+        all_wins = capture.list_windows()
+        # 楓星優先：is_maple_window 為 True 的排最上
+        maple_wins = [w for w in all_wins if capture.is_maple_window(w.title)]
+        other_wins = [w for w in all_wins if not capture.is_maple_window(w.title)]
+        self._windows = maple_wins + other_wins
+
         self._window_combo.clear()
         if not self._windows:
-            self._window_combo.addItem("（無可用視窗）", None)
+            self._window_combo.addItem("（未偵測到視窗，請先開啟楓星）", None)
             return
+
         for w in self._windows:
-            self._window_combo.addItem(w.display, w)
+            label = f"★ {w.display}" if capture.is_maple_window(w.title) else w.display
+            self._window_combo.addItem(label, w)
+
+        # 優先順序：之前選過的視窗 > 自動選第一個楓星 > 第一個視窗
         last = self._settings.get("window_title")
+        chosen_idx = -1
         if last:
             for i, w in enumerate(self._windows):
                 if w.title == last:
-                    self._window_combo.setCurrentIndex(i)
+                    chosen_idx = i
                     break
+        if chosen_idx < 0 and maple_wins:
+            chosen_idx = 0  # 第一個楓星
+        if chosen_idx >= 0:
+            self._window_combo.setCurrentIndex(chosen_idx)
 
     def _on_window_selected(self, index: int) -> None:
         if index < 0 or not self._windows:
@@ -497,6 +565,7 @@ class MainWindow(QMainWindow):
         if self._selected_window:
             self._settings["window_title"] = self._selected_window.title
             settings_mod.save(self._settings)
+            # EXP ROI
             roi_key = f"roi:{self._selected_window.title}"
             saved_roi = self._settings.get(roi_key)
             if saved_roi and len(saved_roi) == 4:
@@ -505,6 +574,14 @@ class MainWindow(QMainWindow):
             else:
                 self._roi = None
                 self._roi_label.setText("尚未設定")
+            # Level ROI
+            level_roi_key = f"level_roi:{self._selected_window.title}"
+            saved_lvl_roi = self._settings.get(level_roi_key)
+            if saved_lvl_roi and len(saved_lvl_roi) == 4:
+                self._level_roi = tuple(int(v) for v in saved_lvl_roi)
+            else:
+                self._level_roi = None
+            self._update_level_roi_label()
 
     def _pick_region(self) -> None:
         if self._selected_window is None:
@@ -530,6 +607,34 @@ class MainWindow(QMainWindow):
         else:
             self._roi_label.setText("尚未設定")
             self._roi_label.setStyleSheet(f"color: {COLORS['fg_muted']};")
+
+    def _pick_level_region(self) -> None:
+        if self._selected_window is None:
+            QMessageBox.warning(self, "需要視窗", "請先選擇目標視窗")
+            return
+        img = capture.grab_window(self._selected_window)
+        if img is None:
+            QMessageBox.warning(self, "擷取失敗", "無法擷取視窗畫面")
+            return
+        dlg = RegionPickerDialog(img, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_region:
+            self._level_roi = dlg.result_region
+            self._update_level_roi_label()
+            key = f"level_roi:{self._selected_window.title}"
+            self._settings[key] = list(self._level_roi)
+            settings_mod.save(self._settings)
+            # 若 worker 在跑，立即套用
+            if self._worker:
+                self._worker.set_level_roi(self._level_roi)
+
+    def _update_level_roi_label(self) -> None:
+        if self._level_roi:
+            x, y, w, h = self._level_roi
+            self._level_roi_label.setText(f"已設定：{w}×{h} @ ({x}, {y})")
+            self._level_roi_label.setStyleSheet(f"color: {COLORS['success']};")
+        else:
+            self._level_roi_label.setText("尚未設定（保留則用手動 / 自動推算）")
+            self._level_roi_label.setStyleSheet(f"color: {COLORS['fg_muted']};")
 
     def _set_interval(self, seconds: float) -> None:
         self._interval = float(seconds)
@@ -646,8 +751,10 @@ class MainWindow(QMainWindow):
         self._device_label.setText(ocr.device_status())
         self._session_start = time.time()
         self._tracker.rate_engine.start_session()
-        self._worker = _Worker(self._selected_window, self._roi, self._interval)
+        self._worker = _Worker(self._selected_window, self._roi, self._interval,
+                               level_roi=self._level_roi)
         self._worker.result_ready.connect(self._on_ocr_result)
+        self._worker.level_result_ready.connect(self._on_level_ocr_result)
         self._worker.error_occurred.connect(self._on_ocr_error)
         self._worker_thread = threading.Thread(
             target=self._worker.run, daemon=True, name="TrackerWorker",
@@ -682,6 +789,14 @@ class MainWindow(QMainWindow):
         self._tracker.note_capture()
         self._tracker.submit(result)
 
+    def _on_level_ocr_result(self, level) -> None:
+        """從等級 ROI OCR 收到結果。連 3 筆同等級才採用。"""
+        if self._tracker.submit_level_ocr(level):
+            # 採用了新等級 — 同步 UI
+            self._refresh_level_display()
+            self._settings["manual_level"] = level
+            settings_mod.save(self._settings)
+
     def _on_ocr_error(self, msg: str) -> None:
         self.statusBar().showMessage(f"擷取錯誤：{msg}", 3000)
 
@@ -695,15 +810,25 @@ class MainWindow(QMainWindow):
     def _show_floating_window(self) -> None:
         if self._floating_window is None:
             self._floating_window = FloatingWindow()
+            # 還原上次大小
+            size = self._settings.get("floating_size")
+            if size and len(size) == 2:
+                self._floating_window.resize(int(size[0]), int(size[1]))
             pos = self._settings.get("floating_pos")
             if pos and len(pos) == 2:
                 self._floating_window.move(int(pos[0]), int(pos[1]))
             opacity = self._settings.get("floating_opacity")
             if opacity is not None:
                 self._floating_window.set_opacity(float(opacity))
+            # 接收 resize signal 存 settings
+            self._floating_window.resized.connect(self._on_floating_resized)
         self._floating_window.show()
         self._float_btn.setChecked(True)
         self._settings["floating_visible"] = True
+        settings_mod.save(self._settings)
+
+    def _on_floating_resized(self, w: int, h: int) -> None:
+        self._settings["floating_size"] = [w, h]
         settings_mod.save(self._settings)
 
     def _hide_floating_window(self) -> None:
@@ -731,12 +856,14 @@ class MainWindow(QMainWindow):
         last_pct = self._tracker.last_pct
         self._cur_exp_lbl.setText(_format_num(last_raw))
         self._pct_value.setText(f"{last_pct:.2f}%" if last_pct is not None else "—")
+        if last_pct is not None:
+            self._hero_bar.setValue(int(last_pct * 100))
         lvl = self._tracker.manual_level
         if lvl is not None:
             auto = " (自動)" if self._tracker.level_auto_detected else ""
             self._level_value.setText(f"Lv {lvl}{auto}")
         else:
-            self._level_value.setText("偵測中…")
+            self._level_value.setText("—")
         self._total_value.setText(_format_num(self._tracker.rate_engine.total_gained))
 
         elapsed_seconds = 0.0
@@ -749,20 +876,29 @@ class MainWindow(QMainWindow):
             self._elapsed_value.setText("00:00:00")
 
         snap = self._tracker.rate_engine.snapshot()
+        rate_1m_snap = snap.get(60)
+        rate_1m_rolling = (rate_1m_snap.rate_per_min
+                           if rate_1m_snap and rate_1m_snap.rate_per_min and rate_1m_snap.rate_per_min > 0
+                           else None)
 
-        def fmt_rate(window_s: int) -> str:
-            s = snap.get(window_s)
-            if not s or s.rate_per_min is None or s.rate_per_min <= 0:
+        # 1 分 / 5 分 / 10 分「實際累積」（跨界鎖定）
+        engine = self._tracker.rate_engine
+        acc_1m = engine.interval_accumulated(60)
+        acc_5m = engine.interval_accumulated(300)
+        acc_10m = engine.interval_accumulated(600)
+
+        self._rate_1m_lbl.setText(_format_num(acc_1m))
+        self._rate_5m_real_lbl.setText(_format_num(acc_5m))
+        self._rate_10m_real_lbl.setText(_format_num(acc_10m))
+
+        # 5 / 10 分推估（用滾動 1m 速率推估，跟累積並列）
+        def fmt_proj(minutes: int) -> str:
+            if not rate_1m_rolling:
                 return "—"
-            suffix = "" if s.saturated else " *"
-            return f"{int(s.rate_per_min):,}/分{suffix}"
+            return f"~{_format_compact(rate_1m_rolling * minutes)}"
 
-        self._rate_1m_lbl.setText(fmt_rate(60))
-        self._rate_5m_lbl.setText(fmt_rate(300))
-        self._rate_10m_lbl.setText(fmt_rate(600))
-        self._rate_30m_lbl.setText(fmt_rate(1800))
-        avg = self._tracker.rate_engine.session_average()
-        self._rate_avg_lbl.setText(f"{int(avg):,}/分" if avg else "—")
+        self._rate_5m_proj_lbl.setText(fmt_proj(5))
+        self._rate_10m_proj_lbl.setText(fmt_proj(10))
 
         cap = self._tracker.level_cap
         eta_seconds = None
@@ -779,36 +915,13 @@ class MainWindow(QMainWindow):
         status = self._tracker.last_status
         self._sample_state_lbl.setText(status.state or "—")
 
-        self._stat_capture_lbl.setText(_format_num(self._tracker.capture_count))
-        self._stat_ok_lbl.setText(_format_num(self._tracker.recognized_count))
-        self._stat_ignored_lbl.setText(_format_num(self._tracker.ignored_count))
-        self._stat_levelup_lbl.setText(_format_num(self._tracker.level_up_count))
-
-        ocr_res = self._tracker.last_ocr
-        if ocr_res:
-            lines = [
-                f"來源：{ocr_res.source or 'N/A'}",
-                f"OCR 原文：{ocr_res.raw_text}",
-                f"raw = {ocr_res.raw}   pct = {ocr_res.pct}",
-                f"視覺 pct = {ocr_res.visual_pct:.2f}%" if ocr_res.visual_pct else "視覺 pct = —",
-                f"信心 = {ocr_res.confidence:.2f}   共識 = {ocr_res.consensus}/{ocr_res.total_votes}",
-            ]
-            if ocr_res.error:
-                lines.append(f"錯誤：{ocr_res.error}")
-            self._last_ocr_text.setPlainText("\n".join(lines))
-
-        if status.corrections:
-            self._corrections_text.append(
-                f"[{time.strftime('%H:%M:%S')}] {' / '.join(status.corrections)}"
-            )
-
         # 同步懸浮視窗
         if self._floating_window and self._floating_window.isVisible():
             self._floating_window.update_data(
                 level=lvl,
                 level_auto=self._tracker.level_auto_detected,
                 pct=last_pct,
-                rate_1m=snap.get(60).rate_per_min if snap.get(60) else None,
+                rate_1m=rate_1m_rolling,
                 rate_5m=snap.get(300).rate_per_min if snap.get(300) else None,
                 rate_10m=snap.get(600).rate_per_min if snap.get(600) else None,
                 eta_seconds=eta_seconds,

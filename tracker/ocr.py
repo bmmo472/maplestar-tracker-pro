@@ -236,3 +236,64 @@ def recognize(image: Image.Image) -> OCRResult:
             result.confidence *= 0.7
 
     return result
+
+
+# ===== 等級辨識（獨立小函數）=====
+import re as _re
+
+_LEVEL_PATTERN = _re.compile(r"(?:Lv\.?\s*|等級\s*|Level\s*|LV\.?\s*)?(\d{1,3})", _re.IGNORECASE)
+
+
+def recognize_level(image: Image.Image) -> Optional[int]:
+    """
+    從等級 ROI 圖辨識 'Lv 158' 之類的等級數字。
+
+    回傳 1-300 之間的整數，失敗回 None。
+    多候選圖跑 OCR 後投票，取最常見的合理值。
+    """
+    if _STATE.engine is None and not init_engine():
+        return None
+
+    from PIL import ImageOps  # 延後 import，沒呼叫此函數時不負擔
+
+    # 等級數字比 EXP 短，多嘗試前處理變體提高命中率
+    base_rgb = image.convert("RGB")
+    candidates = [
+        ("orig", base_rgb),
+        ("gray", base_rgb.convert("L").convert("RGB")),
+        ("invert", ImageOps.invert(base_rgb)),
+    ]
+
+    found_levels: list[int] = []
+    for label, img in candidates:
+        try:
+            prepared = upscale_for_ocr(img)
+            result = _STATE.engine.predict(np.array(prepared))  # type: ignore[union-attr]
+        except Exception:
+            continue
+        for page in (result or []):
+            try:
+                data = dict(page)
+            except Exception:
+                continue
+            ocr_res = data.get("overall_ocr_res") or data
+            texts = list(ocr_res.get("rec_texts") or [])
+            for t in texts:
+                t = str(t).strip()
+                if not t:
+                    continue
+                m = _LEVEL_PATTERN.search(t)
+                if m:
+                    try:
+                        lvl = int(m.group(1))
+                    except ValueError:
+                        continue
+                    if 1 <= lvl <= 300:
+                        found_levels.append(lvl)
+
+    if not found_levels:
+        return None
+
+    # 投票：最常見值勝出
+    most_common = Counter(found_levels).most_common(1)[0][0]
+    return most_common

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -28,6 +29,10 @@ PROGRESS_TOLERANCE_RATIO = 0.025
 LEVEL_RESET_CONFIRM_SAMPLES = 2
 PCT_VISUAL_MISMATCH_TOLERANCE = 3.0
 BASELINE_CONFIRM_DIGIT_MATCH = True
+MEDIAN_FILTER_SIZE = 3
+CONSENSUS_SAMPLES = 5         # 累積 5 筆 OCR 才檢查共識
+CONSENSUS_WINDOW_S = 5.0      # 至少 5 秒才 commit 一次
+CONSENSUS_SPREAD_RATIO = 0.001  # 共識：中央 3 筆 spread 須 < 0.1% raw 值
 
 
 @dataclass
@@ -84,13 +89,19 @@ class Tracker:
         self._manual_level: Optional[int] = None
         self._level_cap: Optional[int] = None
         self._level_auto_detected: bool = False  # 該等級是自動偵測的
-        self._level_votes: list[int] = []        # 自動偵測投票緩衝
+        self._level_votes: list[int] = []        # 自動偵測投票緩衝（從 raw+pct 反推）
+        self._level_ocr_votes: list[int] = []    # 等級 OCR 投票緩衝（直接讀 'Lv 158'）
         self._capture_count = 0
         self._recognized_count = 0
         self._ignored_count = 0
         self._level_up_count = 0
         self._last_status: SampleStatus = SampleStatus()
         self._last_ocr: Optional[OCRResult] = None
+        # OCR 抖動抑制（單筆雜訊）
+        self._raw_filter_buf: deque[int] = deque(maxlen=MEDIAN_FILTER_SIZE)
+        # 5 秒共識緩衝（commit 用）— 存 (t, raw, pct, visual_pct)
+        self._consensus_buf: deque = deque(maxlen=CONSENSUS_SAMPLES * 2)
+        self._last_commit_at: float = 0.0
 
     # ===== 公開 read-only properties =====
     @property
@@ -161,18 +172,23 @@ class Tracker:
                 self._level_cap = None
                 self._level_auto_detected = False
             self._level_votes = []
+            self._level_ocr_votes = []
             self._capture_count = 0
             self._recognized_count = 0
             self._ignored_count = 0
             self._level_up_count = 0
             self._last_status = SampleStatus()
             self._last_ocr = None
+            self._raw_filter_buf.clear()
+            self._consensus_buf.clear()
+            self._last_commit_at = 0.0
 
     def set_manual_level(self, level: Optional[int]) -> None:
         with self._lock:
             self._manual_level = level
             self._level_auto_detected = False
             self._level_votes = []
+            self._level_ocr_votes = []
             if level is not None:
                 self._level_cap = exp_table.cap_for_level(level)
             else:
@@ -187,6 +203,32 @@ class Tracker:
             elif self._level_cap is not None:
                 self._last_pct = raw / self._level_cap * 100
             self.pending = PendingState()
+
+    def submit_level_ocr(self, level: Optional[int]) -> bool:
+        """
+        接收等級 OCR 結果。連續 3 筆同等級才採用，避免單筆 OCR 雜訊污染。
+
+        回傳 True 代表這次有更新等級。
+        手動已設等級的情況下，OCR 仍可覆蓋（前提是穩定 3 筆）。
+        """
+        if level is None or not (1 <= level <= 300):
+            return False
+        with self._lock:
+            self._level_ocr_votes.append(level)
+            if len(self._level_ocr_votes) > 3:
+                self._level_ocr_votes.pop(0)
+            if len(self._level_ocr_votes) < 3:
+                return False
+            # 3 筆都一樣才採用
+            if len(set(self._level_ocr_votes)) != 1:
+                return False
+            confirmed = self._level_ocr_votes[0]
+            if self._manual_level == confirmed:
+                return False  # 沒變化
+            self._manual_level = confirmed
+            self._level_cap = exp_table.cap_for_level(confirmed)
+            self._level_auto_detected = True  # 視為自動偵測
+            return True
 
     def note_capture(self) -> None:
         with self._lock:
@@ -217,8 +259,55 @@ class Tracker:
             raw, pct = corr.raw, corr.pct
             status.corrections = corr.reasons
 
-            # 自動偵測等級（每筆都跑直到確認）
+            # 自動偵測等級用最新 raw（每筆都跑）
             self._try_auto_detect_level(raw, pct)
+
+            # === 5 秒共識門檻 ===
+            # 累積 5 筆 OCR 後檢查共識，不通過整批丟棄等下輪
+            # 寧可慢一點，但累積要準
+            self._consensus_buf.append((t, raw, pct, ocr_result.visual_pct))
+            need_samples = len(self._consensus_buf) < CONSENSUS_SAMPLES
+            need_time = (t - self._last_commit_at) < CONSENSUS_WINDOW_S
+            if need_samples or need_time:
+                have = min(len(self._consensus_buf), CONSENSUS_SAMPLES)
+                status.state = f"取樣中 {have}/{CONSENSUS_SAMPLES}"
+                self._last_status = status
+                return status
+
+            # 取最近 5 筆，排序後去頭去尾取中央 3 筆檢查 spread
+            recent = list(self._consensus_buf)[-CONSENSUS_SAMPLES:]
+            raws_valid = [r[1] for r in recent if r[1] is not None]
+            if len(raws_valid) < CONSENSUS_SAMPLES:
+                status.state = "OCR 樣本不足"
+                self._last_status = status
+                return status
+
+            raws_sorted = sorted(raws_valid)
+            middle = raws_sorted[1:-1]
+            spread = middle[-1] - middle[0]
+            median_raw = middle[len(middle) // 2]
+            spread_threshold = max(int(median_raw * CONSENSUS_SPREAD_RATIO), 5000)
+
+            if spread > spread_threshold:
+                self._ignored_count += 1
+                status.state = "共識失敗"
+                status.reason = f"5 筆中央 spread {spread:,} > 容忍 {spread_threshold:,}"
+                self._last_status = status
+                # 不重置 buf，繼續往下累積，等下次共識
+                return status
+
+            # 共識成立 — 用 median raw / median pct / median visual_pct
+            raw = median_raw
+            pcts_sorted = sorted([r[2] for r in recent if r[2] is not None])
+            if pcts_sorted:
+                pct = pcts_sorted[len(pcts_sorted) // 2]
+            visuals_sorted = sorted([r[3] for r in recent if r[3] is not None])
+            consensus_visual_pct = (visuals_sorted[len(visuals_sorted) // 2]
+                                    if visuals_sorted else ocr_result.visual_pct)
+            # 把 ocr_result 的 visual_pct 替換為共識值，後續邏輯沿用
+            ocr_result.visual_pct = consensus_visual_pct
+
+            self._last_commit_at = t
 
             # 視覺百分比交叉驗證 — 不一致就忽略
             if not self._matches_visual(pct, ocr_result.visual_pct):
@@ -276,6 +365,19 @@ class Tracker:
                         status.reason = f"+{delta:,} 等下一筆確認"
                         self._last_status = status
                         return status
+                    # 確認過的跳動 → 視為 baseline 校正（OCR 早期讀錯），不加 delta
+                    self.pending.clear_jump()
+                    self.pending.clear_reset()
+                    self._last_raw = raw
+                    self._last_pct = pct
+                    self.rate_engine.add(t, self.rate_engine.total_gained)
+                    self._recognized_count += 1
+                    status.accepted = True
+                    status.state = "已採用（基準校正）"
+                    status.reason = f"OCR 跳動 +{delta:,} 視為早期讀值錯誤"
+                    status.raw_after, status.pct_after = raw, pct
+                    self._last_status = status
+                    return status
                 self.pending.clear_jump()
                 self.pending.clear_reset()
                 self._commit(t, raw, pct, delta)
@@ -420,7 +522,11 @@ class Tracker:
 
     def _is_suspicious_jump(self, delta: int, raw: int, pct: Optional[float],
                             visual_pct: Optional[float]) -> bool:
+        # 第一道：沒設等級時用「相對於目前 raw 的比例」防爆
+        # baseline 早期 OCR 讀錯成小數字、後續穩定讀到正確大數字時會觸發
         if self._level_cap is None:
+            if raw > 0 and delta > raw * 0.30:
+                return True
             return False
         cap = self._level_cap
         if delta > cap * 0.5:  # 一筆跳超過 50% 等級

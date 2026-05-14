@@ -136,3 +136,45 @@ class RateEngine:
         if avg and avg > 0:
             return remaining_exp / (avg / 60)
         return None
+
+    def _gained_at(self, target_t: float) -> Optional[int]:
+        """在 samples 中找最接近且 <= target_t 的 total_gained 值。"""
+        if not self._samples:
+            return None
+        best: Optional[int] = None
+        for t, g in self._samples:
+            if t <= target_t:
+                best = g
+            else:
+                break
+        return best
+
+    def interval_accumulated(self, window_seconds: int,
+                             now: Optional[float] = None) -> Optional[int]:
+        """
+        最近一個完整 N 秒區間的累積 EXP（跨界鎖定）。
+
+        以 session_start 為原點切區間：[0,W], [W,2W], [2W,3W]...
+        - elapsed < W：第一個區間還沒過完，回 session start 到現在的累積
+        - elapsed >= W：回最近一個完整區間的累積；進行中區間不採用
+        """
+        if self._session_start is None or not self._samples:
+            return None
+        now = now if now is not None else time.time()
+        elapsed = now - self._session_start
+        if elapsed <= 0:
+            return None
+        if elapsed < window_seconds:
+            # 還沒完成第一個區間，顯示目前累積
+            return self.total_gained
+        # 找最近一個完整區間
+        full_count = int(elapsed // window_seconds)
+        end_offset = full_count * window_seconds
+        start_offset = end_offset - window_seconds
+        start_t = self._session_start + start_offset
+        end_t = self._session_start + end_offset
+        start_g = self._gained_at(start_t)
+        end_g = self._gained_at(end_t)
+        if start_g is None or end_g is None:
+            return None
+        return max(0, int(end_g - start_g))

@@ -1,23 +1,23 @@
-"""Tokyo Night 風格的 QSS。"""
+"""炸彈黃 × 焦黑配色 — 呼應土豆地雷 icon。"""
 
 
-# 主要色票
+# 主要色票 — 暗夜炸藥
 COLORS = {
-    "bg":           "#1a1b26",
-    "panel":        "#1f2335",
-    "panel_2":      "#24283b",
-    "border":       "#2f334d",
-    "border_focus": "#7aa2f7",
-    "fg":           "#c0caf5",
-    "fg_muted":     "#9aa5ce",
-    "fg_dim":       "#565f89",
-    "accent":       "#7aa2f7",  # 藍 — primary
-    "accent_hover": "#89b4fa",
-    "success":      "#9ece6a",  # 綠 — 數值
-    "warning":      "#e0af68",  # 橘 — 注意
-    "danger":       "#f7768e",  # 紅 — 危險
-    "info":         "#7dcfff",  # 青 — 資訊
-    "purple":       "#bb9af7",
+    "bg":           "#0c0a08",   # 焦黑背景
+    "panel":        "#15110c",   # 卡片底（極深焦糖）
+    "panel_2":      "#1f1812",   # 次層
+    "border":       "#2e251c",   # 邊框（深焦糖）
+    "border_focus": "#f0a040",
+    "fg":           "#f5ead8",   # 暖白主文字
+    "fg_muted":     "#8a7a5e",   # 中等淡褐
+    "fg_dim":       "#4a3e2e",   # 標籤暗褐
+    "accent":       "#f0a040",   # 炸彈火光橘 — primary
+    "accent_hover": "#ffba60",
+    "success":      "#d4e85a",   # 爆炸黃綠 — 數值
+    "warning":      "#ff8030",   # 炸藥紅橘
+    "danger":       "#e63950",   # 警告深紅
+    "info":         "#dcc080",   # 沙土黃
+    "purple":       "#c08050",   # 焦糖咖啡
 }
 
 
@@ -31,137 +31,196 @@ def stylesheet() -> str:
         font-size: 13px;
     }}
 
-    QFrame#card {{
+    /* 緊湊資訊條（取代 Card） */
+    QFrame#strip {{
         background-color: {c['panel']};
-        border: 1px solid {c['border']};
-        border-radius: 12px;
+        border: none;
+        border-top: 1px solid {c['border']};
+        border-bottom: 1px solid {c['border']};
     }}
 
-    QFrame#card_inner {{
-        background-color: {c['panel_2']};
-        border: 1px solid {c['border']};
-        border-radius: 10px;
+    QFrame#strip_hero {{
+        background-color: {c['panel']};
+        border: none;
     }}
 
+    QFrame#strip_thin {{
+        background-color: transparent;
+        border-top: 1px solid {c['border']};
+        border-bottom: none;
+    }}
+
+    /* Header */
     QLabel#title {{
-        color: {c['fg']};
-        font-size: 22px;
-        font-weight: bold;
+        color: {c['accent']};
+        font-size: 24px;
+        font-weight: 900;
+        letter-spacing: -0.5px;
     }}
 
-    QLabel#subtitle {{
-        color: {c['fg_muted']};
-        font-size: 12px;
-    }}
-
-    QLabel#section_label {{
+    QLabel#version_line {{
         color: {c['fg_dim']};
         font-size: 11px;
-        font-weight: bold;
-        text-transform: uppercase;
         letter-spacing: 1px;
     }}
 
-    QLabel#metric_value {{
+    /* 主要大數字 — 目前 EXP */
+    QLabel#hero_value {{
         color: {c['success']};
         font-family: "JetBrains Mono", "Consolas", monospace;
-        font-size: 28px;
+        font-size: 56px;
+        font-weight: 900;
+        letter-spacing: -2px;
+    }}
+
+    QLabel#hero_label {{
+        color: {c['fg_dim']};
+        font-size: 10px;
         font-weight: bold;
+        letter-spacing: 2.5px;
     }}
 
-    QLabel#metric_value_small {{
-        color: {c['fg']};
-        font-family: "JetBrains Mono", "Consolas", monospace;
-        font-size: 16px;
-        font-weight: bold;
-    }}
-
-    QLabel#metric_label {{
-        color: {c['fg_muted']};
-        font-size: 11px;
-    }}
-
-    QLabel#rate_primary {{
+    /* 等級 + 百分比 */
+    QLabel#level_value {{
         color: {c['accent']};
         font-family: "JetBrains Mono", "Consolas", monospace;
-        font-size: 24px;
-        font-weight: bold;
+        font-size: 28px;
+        font-weight: 800;
     }}
 
-    QLabel#rate_secondary {{
+    QLabel#pct_value {{
         color: {c['fg']};
         font-family: "JetBrains Mono", "Consolas", monospace;
-        font-size: 14px;
+        font-size: 28px;
+        font-weight: 800;
     }}
 
-    QLabel#badge {{
-        background-color: {c['panel_2']};
+    /* 二級資訊 */
+    QLabel#stat_value {{
+        color: {c['fg']};
+        font-family: "JetBrains Mono", "Consolas", monospace;
+        font-size: 22px;
+        font-weight: 700;
+    }}
+
+    QLabel#stat_value_warn {{
+        color: {c['warning']};
+        font-family: "JetBrains Mono", "Consolas", monospace;
+        font-size: 22px;
+        font-weight: 700;
+    }}
+
+    QLabel#stat_value_accent {{
+        color: {c['accent']};
+        font-family: "JetBrains Mono", "Consolas", monospace;
+        font-size: 22px;
+        font-weight: 700;
+    }}
+
+    QLabel#stat_label {{
+        color: {c['fg_dim']};
+        font-size: 10px;
+        font-weight: bold;
+        letter-spacing: 2px;
+    }}
+
+    QLabel#caption {{
         color: {c['fg_muted']};
-        border: 1px solid {c['border']};
-        border-radius: 10px;
-        padding: 4px 10px;
         font-size: 11px;
+    }}
+
+    /* 進度條 */
+    QProgressBar#hero_bar {{
+        background-color: {c['panel_2']};
+        border: 1px solid {c['border']};
+        border-radius: 2px;
+        max-height: 4px;
+        min-height: 4px;
+        text-align: center;
+        color: transparent;
+    }}
+
+    QProgressBar#hero_bar::chunk {{
+        background-color: {c['accent']};
+        border-radius: 1px;
+    }}
+
+    /* 狀態徽章 */
+    QLabel#badge {{
+        background-color: transparent;
+        color: {c['fg_dim']};
+        border: 1px solid {c['border']};
+        border-radius: 3px;
+        padding: 3px 10px;
+        font-size: 10px;
+        letter-spacing: 1.5px;
+        font-weight: bold;
     }}
 
     QLabel#badge_live {{
-        background-color: rgba(158, 206, 106, 25);
-        color: {c['success']};
-        border: 1px solid {c['success']};
-        border-radius: 10px;
-        padding: 4px 10px;
-        font-size: 11px;
+        background-color: {c['accent']};
+        color: {c['bg']};
+        border: 1px solid {c['accent']};
+        border-radius: 3px;
+        padding: 3px 10px;
+        font-size: 10px;
+        letter-spacing: 1.5px;
         font-weight: bold;
     }}
 
+    /* 按鈕 — 方正、無圓角、邊框感 */
     QPushButton {{
-        background-color: {c['panel_2']};
-        color: {c['fg']};
+        background-color: transparent;
+        color: {c['fg_muted']};
         border: 1px solid {c['border']};
-        border-radius: 8px;
-        padding: 8px 14px;
+        border-radius: 2px;
+        padding: 7px 14px;
         font-size: 12px;
+        font-weight: bold;
+        letter-spacing: 1px;
     }}
 
     QPushButton:hover {{
-        background-color: {c['border']};
+        color: {c['fg']};
         border-color: {c['accent']};
     }}
 
     QPushButton:pressed {{
-        background-color: {c['panel']};
+        background-color: {c['panel_2']};
     }}
 
     QPushButton:disabled {{
         color: {c['fg_dim']};
-        background-color: {c['panel']};
+        border-color: {c['border']};
     }}
 
     QPushButton#primary {{
         background-color: {c['accent']};
         color: {c['bg']};
         border: 1px solid {c['accent']};
-        font-weight: bold;
     }}
 
     QPushButton#primary:hover {{
         background-color: {c['accent_hover']};
+        border-color: {c['accent_hover']};
     }}
 
     QPushButton#danger {{
         background-color: transparent;
         color: {c['danger']};
-        border: 1px solid {c['danger']};
+        border: 1px solid {c['border']};
     }}
 
     QPushButton#danger:hover {{
-        background-color: rgba(247, 118, 142, 30);
+        border-color: {c['danger']};
     }}
 
     QPushButton#segment {{
-        background-color: {c['panel_2']};
+        background-color: transparent;
         color: {c['fg_muted']};
         border: 1px solid {c['border']};
-        padding: 6px 10px;
+        border-radius: 2px;
+        padding: 5px 9px;
         font-size: 11px;
     }}
 
@@ -169,16 +228,16 @@ def stylesheet() -> str:
         background-color: {c['accent']};
         color: {c['bg']};
         border-color: {c['accent']};
-        font-weight: bold;
     }}
 
+    /* 下拉選單 */
     QComboBox {{
         background-color: {c['panel_2']};
         color: {c['fg']};
         border: 1px solid {c['border']};
-        border-radius: 8px;
+        border-radius: 2px;
         padding: 6px 10px;
-        min-height: 24px;
+        min-height: 22px;
     }}
 
     QComboBox:hover {{
@@ -198,50 +257,44 @@ def stylesheet() -> str:
         width: 20px;
     }}
 
+    /* Tab */
     QTabWidget::pane {{
         border: 1px solid {c['border']};
-        border-radius: 8px;
+        border-radius: 0;
         background-color: {c['panel']};
         top: -1px;
     }}
 
     QTabBar::tab {{
         background-color: transparent;
-        color: {c['fg_muted']};
-        padding: 8px 18px;
+        color: {c['fg_dim']};
+        padding: 8px 22px;
         border: 1px solid transparent;
-        border-bottom: none;
-        border-top-left-radius: 6px;
-        border-top-right-radius: 6px;
+        border-bottom: 2px solid transparent;
         font-size: 12px;
+        font-weight: bold;
+        letter-spacing: 1.5px;
     }}
 
     QTabBar::tab:selected {{
-        background-color: {c['panel']};
-        color: {c['fg']};
-        border-color: {c['border']};
+        color: {c['accent']};
+        border-bottom: 2px solid {c['accent']};
     }}
 
     QTabBar::tab:hover:!selected {{
         color: {c['fg']};
     }}
 
-    QTextEdit, QPlainTextEdit {{
-        background-color: {c['panel_2']};
-        color: {c['fg']};
-        border: 1px solid {c['border']};
-        border-radius: 8px;
-        padding: 6px;
-        font-family: "JetBrains Mono", "Consolas", monospace;
-        font-size: 11px;
-    }}
-
+    /* 狀態列 */
     QStatusBar {{
         background-color: {c['bg']};
-        color: {c['fg_muted']};
+        color: {c['fg_dim']};
         border-top: 1px solid {c['border']};
+        font-size: 10px;
+        letter-spacing: 1px;
     }}
 
+    /* Tooltip */
     QToolTip {{
         background-color: {c['panel_2']};
         color: {c['fg']};

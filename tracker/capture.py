@@ -15,6 +15,24 @@ except ImportError:
     pwc = None  # type: ignore[assignment]
 
 
+# 楓星視窗 keyword — 包含這些字樣的視窗會自動排最上、加 ★ 標記、啟動自動選
+# 廠商品牌名「MapleStory Worlds」相對固定，但 title 後綴會變（-楓星 / -角色名）
+# 未來要加韓服 / 中服只要加一行
+MAPLE_KEYWORDS = (
+    "MapleStory Worlds",
+    "楓之谷 Worlds",
+    "메이플스토리 월드",
+)
+
+
+def is_maple_window(title: str) -> bool:
+    """判斷一個視窗 title 是否為楓星。case-insensitive 匹配 keyword。"""
+    if not title:
+        return False
+    t = title.lower()
+    return any(kw.lower() in t for kw in MAPLE_KEYWORDS)
+
+
 @dataclass
 class WindowInfo:
     title: str
