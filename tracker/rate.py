@@ -152,11 +152,16 @@ class RateEngine:
     def interval_accumulated(self, window_seconds: int,
                              now: Optional[float] = None) -> Optional[int]:
         """
-        最近一個完整 N 秒區間的累積 EXP（跨界鎖定）。
+        最近一個完整 N 秒區間的累積 EXP。
 
         以 session_start 為原點切區間：[0,W], [W,2W], [2W,3W]...
         - elapsed < W：第一個區間還沒過完，回 session start 到現在的累積
-        - elapsed >= W：回最近一個完整區間的累積；進行中區間不採用
+        - elapsed >= W：永遠回**最近一個完整區間**的累積值（不會被「進行中」覆蓋）
+
+        例如 5 分鐘區間：
+        - t=300s 第 1 區間完成累積 3M  → 顯示 3M
+        - t=400s 第 2 區間進行中       → 還是顯示 3M（鎖定）
+        - t=600s 第 2 區間完成累積 2.5M → 顯示 2.5M
         """
         if self._session_start is None or not self._samples:
             return None

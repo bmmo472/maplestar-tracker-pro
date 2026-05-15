@@ -28,7 +28,7 @@ from .styles import COLORS, stylesheet
 
 SAMPLE_INTERVAL_OPTIONS: tuple[float, ...] = (0.5, 1, 2, 3, 5, 10)
 APP_TITLE = "MapleStar Tracker Pro"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 AUTHOR = "土豆地雷"
 COPYRIGHT = f"© 2026 {AUTHOR}"
 
@@ -198,8 +198,10 @@ class MainWindow(QMainWindow):
         self._level_roi: Optional[tuple[int, int, int, int]] = None
         self._interval = 1.0
         self._settings = settings_mod.load()
-        self._session_start: Optional[float] = None
-        self._use_gpu: bool = bool(self._settings.get("use_gpu", False))
+        self._session_start: Optional[float] = None  # 本次開始追蹤的時間（每次 start 重設）
+        self._accumulated_elapsed: float = 0.0       # 之前已累積的追蹤秒數（跨 pause/resume 保留）
+        self._use_gpu: bool = False  # v1.3 暫時停用 GPU，強制 CPU
+        self._settings["use_gpu"] = False
         self._floating_window: Optional[FloatingWindow] = None
 
         manual_level = self._settings.get("manual_level")
@@ -223,6 +225,9 @@ class MainWindow(QMainWindow):
         self._ui_timer.timeout.connect(self._tick_ui)
         self._ui_timer.start()
 
+        # 啟動 3 秒後背景檢查更新（避免阻塞啟動）
+        QTimer.singleShot(3000, self._check_for_updates)
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
@@ -235,6 +240,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_tracker_tab(), "即時追蹤")
         tabs.addTab(self._build_setup_tab(), "設定")
+        tabs.addTab(self._build_help_tab(), "使用說明")
         root.addWidget(tabs, 1)
 
         status_bar = QStatusBar()
@@ -504,20 +510,20 @@ class MainWindow(QMainWindow):
         self._engine_cpu_btn = QPushButton("CPU")
         self._engine_cpu_btn.setObjectName("segment")
         self._engine_cpu_btn.setCheckable(True)
-        self._engine_gpu_btn = QPushButton("GPU（需 paddlepaddle-gpu）")
+        self._engine_cpu_btn.setChecked(True)
+        self._engine_gpu_btn = QPushButton("GPU（暫不支援）")
         self._engine_gpu_btn.setObjectName("segment")
-        self._engine_gpu_btn.setCheckable(True)
+        self._engine_gpu_btn.setCheckable(False)
+        self._engine_gpu_btn.setEnabled(False)
         self._engine_group.addButton(self._engine_cpu_btn)
-        self._engine_group.addButton(self._engine_gpu_btn)
         self._engine_cpu_btn.clicked.connect(lambda: self._set_use_gpu(False))
-        self._engine_gpu_btn.clicked.connect(lambda: self._set_use_gpu(True))
         engine_row.addWidget(self._engine_cpu_btn)
         engine_row.addWidget(self._engine_gpu_btn)
         engine_row.addStretch(1)
         engine_layout.addLayout(engine_row)
         engine_hint = QLabel(
-            "GPU 推論約 30ms/張、CPU 約 150–400ms。GPU 版需安裝 paddlepaddle-gpu 與對應 CUDA。"
-            "若 GPU 啟動失敗會自動回退 CPU。"
+            "目前發行版本只內建 CPU 推論。GPU 版需另外打包，本版本停用此選項。\n"
+            "CPU 推論 150-400ms，對楓星 1Hz 取樣完全足夠。"
         )
         engine_hint.setObjectName("subtitle")
         engine_hint.setWordWrap(True)
@@ -526,6 +532,136 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
         return page
+
+    def _build_help_tab(self) -> QWidget:
+        """使用說明分頁 — 完整步驟＋常見問題，內嵌不需另外開檔。"""
+        from PySide6.QtWidgets import QScrollArea, QTextBrowser
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {COLORS['panel']};
+                color: {COLORS['fg']};
+                border: none;
+                padding: 20px 28px;
+                font-size: 13px;
+                line-height: 1.6;
+            }}
+        """)
+        browser.setHtml(self._help_html())
+        outer.addWidget(browser)
+        return page
+
+    def _help_html(self) -> str:
+        """使用說明 HTML — 給內嵌 QTextBrowser 用。"""
+        c = COLORS
+        return f"""
+        <style>
+            h2 {{ color: {c['accent']}; font-size: 18px; margin-top: 24px; margin-bottom: 8px; }}
+            h3 {{ color: {c['success']}; font-size: 14px; margin-top: 16px; }}
+            p, li {{ color: {c['fg']}; font-size: 13px; }}
+            .key {{ color: {c['accent']}; font-weight: bold; }}
+            .warn {{ color: {c['warning']}; font-weight: bold; }}
+            .bad {{ color: {c['danger']}; }}
+            .ok {{ color: {c['success']}; }}
+            ul {{ margin-left: 0; padding-left: 20px; }}
+            code {{ background: {c['panel_2']}; padding: 2px 6px; border-radius: 3px; color: {c['accent']}; }}
+        </style>
+
+        <h2>快速開始</h2>
+        <p><span class="key">第一次使用</span>，按順序做：</p>
+        <ul>
+            <li>1. 先把楓星開起來（任何畫面都可以）</li>
+            <li>2. 切到「設定」分頁</li>
+            <li>3. 上面「目標視窗」會自動帶 <span class="ok">★</span> 標記選好楓星</li>
+            <li>4. 點「框選 EXP 區域」</li>
+            <li>5. 框出 EXP 那一條 — <span class="warn">含進度條 + 數字一起框</span></li>
+            <li>6. 點「框選等級區域」（可選），框出「Lv 158」那塊</li>
+            <li>7. 切回「即時追蹤」→ 點「開始追蹤」</li>
+        </ul>
+
+        <h2>EXP 區域怎麼框</h2>
+        <p><span class="ok">✓ 正確</span>：框整個 EXP 列，含左邊進度條 + 右邊數字</p>
+        <p><span class="bad">✗ 錯誤</span>：只框數字緊貼 — paddle OCR 反而會偵測失敗</p>
+        <p>上下留 2-5 px 邊，不要框到 HP/MP 那兩列。</p>
+        <p>合理 ROI 尺寸大約 <code>500×35</code>，太緊（高度 &lt; 25px）會讀不到。</p>
+
+        <h2>楓星解析度建議</h2>
+        <p>建議 <span class="key">1600×900 以上</span>，最好 1920×1080。</p>
+        <p>1280×720 EXP 字體太小，OCR 會頻繁失敗（顯示「樣本驗證中」）。</p>
+
+        <h2>狀態欄看不懂？</h2>
+        <p>「即時追蹤」分頁右下「資料更新」欄位會顯示工具當下在做什麼：</p>
+        <ul>
+            <li><b>收集樣本 N/5</b> → 正常，工具在累積 OCR 樣本</li>
+            <li><b>同步完成</b> → 正常，剛採用一筆共識結果</li>
+            <li><b>起始基準設定</b> → 正常，第一次校準</li>
+            <li><b>樣本驗證中</b> → OCR 結果還不穩，工具在等更穩定的取樣（多等幾秒就好）</li>
+            <li><b>等待下一筆</b> → 這一筆讀不到，下一筆會繼續</li>
+            <li><b>等級切換</b> → 偵測到升級</li>
+            <li><b>確認中</b> → 看到數字大跳，等下一筆確認</li>
+        </ul>
+        <p><span class="key">看到「樣本驗證中」不是壞了</span>，是工具在挑乾淨的樣本。
+        慢一點但準是設計目的。</p>
+
+        <h2>速率欄位意思</h2>
+        <ul>
+            <li><b>1 分速率</b> = 上一個完整 60 秒打的（每分鐘更新一次）</li>
+            <li><b>5 分累積</b> = 上一個完整 5 分鐘打的（鎖定值，新區間打完才更新）</li>
+            <li><b>10 分累積</b> = 同上但 10 分鐘</li>
+            <li><b>5/10 分推估</b> = 用目前速率推估能打多少（~ 代表是預估）</li>
+        </ul>
+
+        <h2>懸浮視窗</h2>
+        <p>主視窗右上「懸浮視窗」按鈕 → 跳出小視窗</p>
+        <ul>
+            <li>永遠在最上層、半透明可拖動</li>
+            <li>右下角拖拉調整大小</li>
+            <li>右鍵選單調透明度、預設尺寸、關閉</li>
+        </ul>
+
+        <h2>常見問題</h2>
+        <h3>累積 EXP 一直 0</h3>
+        <p>看「資料更新」狀態：</p>
+        <ul>
+            <li>一直「等待下一筆」→ EXP 框錯位置，重框</li>
+            <li>一直「樣本驗證中」→ 楓星解析度太小，拉到 1600×900 以上</li>
+            <li>「同步完成」但累積還是 0 → 確認你真的在打怪</li>
+        </ul>
+
+        <h3>等級顯示錯誤</h3>
+        <p>重新「框選等級區域」，框含整個 Lv 數字（不要切太緊）。</p>
+        <p>或回「即時追蹤」分頁，「校正目前等級」手動輸入。</p>
+
+        <h3>升下一級時間不準</h3>
+        <p>剛開始前 5 分鐘速率還沒穩，跑 10 分鐘後就準。</p>
+
+        <h3>OCR 引擎只能選 CPU？</h3>
+        <p>本版本暫時只支援 CPU 推論。CPU 150-400ms 對楓星 1 秒取樣完全夠用。</p>
+
+        <h3>可以同時追蹤多個角色嗎</h3>
+        <p>可以。再開一個 EXE 選不同視窗就好。</p>
+
+        <h2>設定檔位置</h2>
+        <p>存在 <code>%APPDATA%\\MapleStarTrackerPro\\settings.json</code></p>
+        <p>包含視窗選擇、ROI、等級、浮窗位置/大小/透明度。</p>
+        <p>要重置所有設定就刪掉這個檔。</p>
+
+        <h2>問題回報</h2>
+        <p>截圖 + 「資料更新」狀態 + 操作步驟 → 私訊或 GitHub Issue：</p>
+        <p><a href="https://github.com/bmmo472/maplestar-tracker-pro/issues">
+            https://github.com/bmmo472/maplestar-tracker-pro/issues
+        </a></p>
+
+        <p style="margin-top: 40px; color: {c['fg_dim']}; font-size: 11px;">
+            v{APP_VERSION} · 土豆地雷 出品
+        </p>
+        """
 
     # ===== 控制邏輯 =====
     def _refresh_windows(self) -> None:
@@ -749,8 +885,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "OCR 啟動失敗", ocr.last_error() or "未知錯誤")
                 return
         self._device_label.setText(ocr.device_status())
+        # 第一次 start：重置累積時間並啟動 rate engine session
+        # 後續 resume：累積時間不動，只更新 session_start 開始計算這一段
+        is_first_start = (self._session_start is None and self._accumulated_elapsed == 0.0)
+        if is_first_start:
+            self._tracker.rate_engine.start_session()
         self._session_start = time.time()
-        self._tracker.rate_engine.start_session()
         self._worker = _Worker(self._selected_window, self._roi, self._interval,
                                level_roi=self._level_roi)
         self._worker.result_ready.connect(self._on_ocr_result)
@@ -768,6 +908,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("追蹤中…")
 
     def _stop_tracking(self) -> None:
+        # 凍結這一段的累積時間
+        if self._session_start is not None:
+            self._accumulated_elapsed += time.time() - self._session_start
+            self._session_start = None
         if self._worker:
             self._worker.stop()
             self._worker = None
@@ -784,6 +928,7 @@ class MainWindow(QMainWindow):
             self._stop_tracking()
         self._tracker.reset()
         self._session_start = None
+        self._accumulated_elapsed = 0.0
 
     def _on_ocr_result(self, result) -> None:
         self._tracker.note_capture()
@@ -866,9 +1011,10 @@ class MainWindow(QMainWindow):
             self._level_value.setText("—")
         self._total_value.setText(_format_num(self._tracker.rate_engine.total_gained))
 
-        elapsed_seconds = 0.0
-        if self._session_start:
-            elapsed_seconds = time.time() - self._session_start
+        elapsed_seconds = self._accumulated_elapsed
+        if self._session_start is not None:
+            elapsed_seconds += time.time() - self._session_start
+        if elapsed_seconds > 0:
             hh, rem = divmod(int(elapsed_seconds), 3600)
             mm, ss = divmod(rem, 60)
             self._elapsed_value.setText(f"{hh:02}:{mm:02}:{ss:02}")
@@ -922,13 +1068,119 @@ class MainWindow(QMainWindow):
                 level_auto=self._tracker.level_auto_detected,
                 pct=last_pct,
                 rate_1m=rate_1m_rolling,
-                rate_5m=snap.get(300).rate_per_min if snap.get(300) else None,
-                rate_10m=snap.get(600).rate_per_min if snap.get(600) else None,
+                acc_5m=acc_5m,
+                acc_10m=acc_10m,
                 eta_seconds=eta_seconds,
                 elapsed_seconds=elapsed_seconds,
                 total_gained=self._tracker.rate_engine.total_gained,
                 tracking=self._worker is not None,
             )
+
+    def _check_for_updates(self) -> None:
+        """背景檢查 GitHub 最新 release，有新版彈通知對話框。"""
+        # 在另一個 thread 跑網路請求，避免阻塞 UI
+        from PySide6.QtCore import QThread, QObject as _QObj, Signal as _Sig
+        from tracker import updater
+
+        class _UpdateWorker(_QObj):
+            done = _Sig(object)  # UpdateInfo or None
+
+            def __init__(self, version: str):
+                super().__init__()
+                self._version = version
+
+            def run(self):
+                info = updater.check_for_updates(self._version, timeout=5.0)
+                self.done.emit(info)
+
+        # 跳過：用戶設定過「不再提醒這個版本」
+        skip_version = self._settings.get("update_skip_version")
+
+        thread = QThread(self)
+        worker = _UpdateWorker(APP_VERSION)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def on_done(info):
+            thread.quit()
+            if info is None:
+                return  # 網路失敗或解析失敗 — 靜默跳過
+            if not info.is_newer:
+                return
+            if skip_version == info.latest_version:
+                return
+            self._show_update_dialog(info)
+
+        worker.done.connect(on_done)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # 保留 thread 參考避免 GC
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    def _show_update_dialog(self, info) -> None:
+        """彈出更新通知對話框。"""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QPlainTextEdit
+        import webbrowser
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("發現新版本")
+        dlg.setMinimumSize(480, 360)
+        dlg.setStyleSheet(stylesheet())
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
+
+        title = QLabel(f"新版本可用：v{info.latest_version}")
+        title.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {COLORS['accent']};")
+        layout.addWidget(title)
+
+        info_lbl = QLabel(f"目前版本：v{info.current_version}")
+        info_lbl.setStyleSheet(f"color: {COLORS['fg_muted']}; font-size: 12px;")
+        layout.addWidget(info_lbl)
+
+        notes_lbl = QLabel("更新內容：")
+        notes_lbl.setStyleSheet(f"color: {COLORS['fg']}; font-size: 12px; margin-top: 8px;")
+        layout.addWidget(notes_lbl)
+
+        notes = QPlainTextEdit()
+        notes.setReadOnly(True)
+        notes.setPlainText(info.release_notes or "（無說明）")
+        notes.setStyleSheet(f"""
+            background: {COLORS['panel_2']};
+            color: {COLORS['fg']};
+            border: 1px solid {COLORS['border']};
+            border-radius: 4px;
+            padding: 10px;
+            font-size: 12px;
+        """)
+        layout.addWidget(notes, 1)
+
+        btn_box = QDialogButtonBox()
+        download_btn = btn_box.addButton("前往下載", QDialogButtonBox.ButtonRole.AcceptRole)
+        download_btn.setObjectName("primary")
+        skip_btn = btn_box.addButton("略過此版本", QDialogButtonBox.ButtonRole.DestructiveRole)
+        later_btn = btn_box.addButton("稍後提醒", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(btn_box)
+
+        def on_download():
+            webbrowser.open(info.release_url)
+            dlg.accept()
+
+        def on_skip():
+            self._settings["update_skip_version"] = info.latest_version
+            settings_mod.save(self._settings)
+            dlg.reject()
+
+        def on_later():
+            dlg.reject()
+
+        download_btn.clicked.connect(on_download)
+        skip_btn.clicked.connect(on_skip)
+        later_btn.clicked.connect(on_later)
+        dlg.exec()
 
     def closeEvent(self, event):
         if self._worker:

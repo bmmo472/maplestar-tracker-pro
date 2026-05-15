@@ -270,7 +270,7 @@ class Tracker:
             need_time = (t - self._last_commit_at) < CONSENSUS_WINDOW_S
             if need_samples or need_time:
                 have = min(len(self._consensus_buf), CONSENSUS_SAMPLES)
-                status.state = f"取樣中 {have}/{CONSENSUS_SAMPLES}"
+                status.state = f"收集樣本 {have}/{CONSENSUS_SAMPLES}"
                 self._last_status = status
                 return status
 
@@ -290,7 +290,7 @@ class Tracker:
 
             if spread > spread_threshold:
                 self._ignored_count += 1
-                status.state = "共識失敗"
+                status.state = "樣本驗證中"
                 status.reason = f"5 筆中央 spread {spread:,} > 容忍 {spread_threshold:,}"
                 self._last_status = status
                 # 不重置 buf，繼續往下累積，等下次共識
@@ -329,7 +329,7 @@ class Tracker:
                 self._adopt_first(raw, pct, t)
                 self._recognized_count += 1
                 status.accepted = True
-                status.state = "已採用（基準）"
+                status.state = "起始基準設定"
                 status.raw_after, status.pct_after = raw, pct
                 self._last_status = status
                 return status
@@ -350,7 +350,7 @@ class Tracker:
                 self._commit(t, raw, pct, gained)
                 self._recognized_count += 1
                 status.accepted = True
-                status.state = "已採用（升級）"
+                status.state = "等級切換"
                 status.reason = f"補算 {remaining:,} + 新等 {raw:,}"
                 status.raw_after, status.pct_after = raw, pct
                 self._last_status = status
@@ -361,7 +361,7 @@ class Tracker:
                 if self._is_suspicious_jump(delta, raw, pct, ocr_result.visual_pct):
                     if not self._confirm_jump(raw, t):
                         self._ignored_count += 1
-                        status.state = "待確認（跳動）"
+                        status.state = "確認中"
                         status.reason = f"+{delta:,} 等下一筆確認"
                         self._last_status = status
                         return status
@@ -373,7 +373,7 @@ class Tracker:
                     self.rate_engine.add(t, self.rate_engine.total_gained)
                     self._recognized_count += 1
                     status.accepted = True
-                    status.state = "已採用（基準校正）"
+                    status.state = "重新校正"
                     status.reason = f"OCR 跳動 +{delta:,} 視為早期讀值錯誤"
                     status.raw_after, status.pct_after = raw, pct
                     self._last_status = status
@@ -383,7 +383,7 @@ class Tracker:
                 self._commit(t, raw, pct, delta)
                 self._recognized_count += 1
                 status.accepted = True
-                status.state = "已採用"
+                status.state = "同步完成"
                 status.raw_after, status.pct_after = raw, pct
                 self._last_status = status
                 return status
@@ -407,7 +407,7 @@ class Tracker:
                 self._last_pct = pct
                 self.rate_engine.add(t, self.rate_engine.total_gained)
                 status.accepted = True
-                status.state = "已採用（回補修正）"
+                status.state = "資料修正"
                 status.raw_after, status.pct_after = raw, pct
                 self._recognized_count += 1
                 self._last_status = status

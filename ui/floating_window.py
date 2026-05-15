@@ -223,8 +223,8 @@ class FloatingWindow(QWidget):
         # 速率
         layout.addSpacing(2)
         self._rate_1m_lbl = self._add_row(layout, "1 分速率", primary=True)
-        self._rate_5m_lbl = self._add_row(layout, "5 分預估")
-        self._rate_10m_lbl = self._add_row(layout, "10 分預估")
+        self._rate_5m_lbl = self._add_row(layout, "5 分累積")
+        self._rate_10m_lbl = self._add_row(layout, "10 分累積")
 
         layout.addSpacing(2)
         self._eta_lbl = self._add_row(layout, "升下一級", value_object="float_eta_value")
@@ -336,8 +336,8 @@ class FloatingWindow(QWidget):
                     level_auto: bool,
                     pct: Optional[float],
                     rate_1m: Optional[float],
-                    rate_5m: Optional[float],
-                    rate_10m: Optional[float],
+                    acc_5m: Optional[int],
+                    acc_10m: Optional[int],
                     eta_seconds: Optional[float],
                     elapsed_seconds: float,
                     total_gained: Optional[int],
@@ -372,13 +372,9 @@ class FloatingWindow(QWidget):
         # 1 分速率（即時，由 main_window 傳入滾動值）
         self._rate_1m_lbl.setText(_format_rate(rate_1m))
 
-        # 5 / 10 分推估（用 1m 推估累積總量）
-        if rate_1m and rate_1m > 0:
-            self._rate_5m_lbl.setText(f"~{_format_num(rate_1m * 5)}")
-            self._rate_10m_lbl.setText(f"~{_format_num(rate_1m * 10)}")
-        else:
-            self._rate_5m_lbl.setText("—")
-            self._rate_10m_lbl.setText("—")
+        # 5 / 10 分實際累積（跨界鎖定）
+        self._rate_5m_lbl.setText(_format_num(acc_5m))
+        self._rate_10m_lbl.setText(_format_num(acc_10m))
 
         # ETA / 累計 / 累積
         self._eta_lbl.setText(_format_eta(eta_seconds))
