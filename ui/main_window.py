@@ -28,7 +28,7 @@ from .styles import COLORS, stylesheet
 
 SAMPLE_INTERVAL_OPTIONS: tuple[float, ...] = (0.5, 1, 2, 3, 5, 10)
 APP_TITLE = "MapleStar Tracker Pro"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.3"
 AUTHOR = "土豆地雷"
 COPYRIGHT = f"© 2026 {AUTHOR}"
 
@@ -93,9 +93,14 @@ class _Worker(QObject):
                     self._tick += 1
                 except Exception as e:
                     self.error_occurred.emit(str(e))
-                wait_until = start + self._interval
-                while self._running and time.time() < wait_until:
-                    time.sleep(min(0.05, wait_until - time.time()))
+
+                # 等待下一次 — 分大塊 sleep 比連續小 sleep 省 CPU
+                # 大段 sleep 讓 OS 真的進入 idle，不會 busy poll
+                remaining = (start + self._interval) - time.time()
+                while self._running and remaining > 0:
+                    chunk = 0.2 if remaining > 0.2 else remaining
+                    time.sleep(chunk)
+                    remaining = (start + self._interval) - time.time()
 
 
 def _make_card(parent: QWidget, title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -200,8 +205,13 @@ class MainWindow(QMainWindow):
         self._settings = settings_mod.load()
         self._session_start: Optional[float] = None  # 本次開始追蹤的時間（每次 start 重設）
         self._accumulated_elapsed: float = 0.0       # 之前已累積的追蹤秒數（跨 pause/resume 保留）
-        self._use_gpu: bool = False  # v1.3 暫時停用 GPU，強制 CPU
-        self._settings["use_gpu"] = False
+        # GPU 偏好：從 settings 讀，但若當前環境不支援 GPU 自動降回 CPU
+        wants_gpu = bool(self._settings.get("use_gpu", False))
+        self._use_gpu: bool = wants_gpu and ocr.gpu_available()
+        if wants_gpu and not self._use_gpu:
+            # 之前設定過 GPU 但當前環境（CPU 版 EXE）不支援，校正回 CPU
+            self._settings["use_gpu"] = False
+            settings_mod.save(self._settings)
         self._floating_window: Optional[FloatingWindow] = None
 
         manual_level = self._settings.get("manual_level")
@@ -510,21 +520,42 @@ class MainWindow(QMainWindow):
         self._engine_cpu_btn = QPushButton("CPU")
         self._engine_cpu_btn.setObjectName("segment")
         self._engine_cpu_btn.setCheckable(True)
-        self._engine_cpu_btn.setChecked(True)
-        self._engine_gpu_btn = QPushButton("GPU（暫不支援）")
+
+        # GPU 按鈕智慧偵測 — 編譯有 CUDA 支援才啟用
+        gpu_ok = ocr.gpu_available()
+        if gpu_ok:
+            self._engine_gpu_btn = QPushButton("GPU")
+        else:
+            self._engine_gpu_btn = QPushButton("GPU（本版本不支援）")
         self._engine_gpu_btn.setObjectName("segment")
-        self._engine_gpu_btn.setCheckable(False)
-        self._engine_gpu_btn.setEnabled(False)
+        self._engine_gpu_btn.setCheckable(gpu_ok)
+        self._engine_gpu_btn.setEnabled(gpu_ok)
+
         self._engine_group.addButton(self._engine_cpu_btn)
+        if gpu_ok:
+            self._engine_group.addButton(self._engine_gpu_btn)
         self._engine_cpu_btn.clicked.connect(lambda: self._set_use_gpu(False))
+        if gpu_ok:
+            self._engine_gpu_btn.clicked.connect(lambda: self._set_use_gpu(True))
+        # 設定當前狀態（受 settings 跟 gpu_ok 影響）
+        if self._use_gpu and gpu_ok:
+            self._engine_gpu_btn.setChecked(True)
+        else:
+            self._engine_cpu_btn.setChecked(True)
         engine_row.addWidget(self._engine_cpu_btn)
         engine_row.addWidget(self._engine_gpu_btn)
         engine_row.addStretch(1)
         engine_layout.addLayout(engine_row)
-        engine_hint = QLabel(
-            "目前發行版本只內建 CPU 推論。GPU 版需另外打包，本版本停用此選項。\n"
-            "CPU 推論 150-400ms，對楓星 1Hz 取樣完全足夠。"
-        )
+        if gpu_ok:
+            engine_hint = QLabel(
+                "GPU 推論約 20-40 ms / 張，比 CPU 快 5-10 倍。"
+                "切換 GPU 後取樣間隔可調 0.5 秒體驗更即時。"
+            )
+        else:
+            engine_hint = QLabel(
+                "本版本只內建 CPU 推論。如需 GPU 版本請另外下載 GPU 打包版（需 NVIDIA 顯卡）。\n"
+                "CPU 推論 150-400ms，對楓星 1Hz 取樣完全足夠。"
+            )
         engine_hint.setObjectName("subtitle")
         engine_hint.setWordWrap(True)
         engine_layout.addWidget(engine_hint)
@@ -890,6 +921,9 @@ class MainWindow(QMainWindow):
         is_first_start = (self._session_start is None and self._accumulated_elapsed == 0.0)
         if is_first_start:
             self._tracker.rate_engine.start_session()
+        else:
+            # 從暫停恢復 — 通知 rate engine 把這次暫停時長補進累計
+            self._tracker.rate_engine.resume()
         self._session_start = time.time()
         self._worker = _Worker(self._selected_window, self._roi, self._interval,
                                level_roi=self._level_roi)
@@ -912,6 +946,8 @@ class MainWindow(QMainWindow):
         if self._session_start is not None:
             self._accumulated_elapsed += time.time() - self._session_start
             self._session_start = None
+        # 通知 rate engine 進入暫停（停止期間不算進有效追蹤時長）
+        self._tracker.rate_engine.pause()
         if self._worker:
             self._worker.stop()
             self._worker = None

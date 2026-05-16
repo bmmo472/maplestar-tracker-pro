@@ -16,7 +16,18 @@ from typing import Callable, Optional
 from . import exp_table
 
 
-CONFUSED_DIGITS = "689"
+CONFUSED_DIGITS = "035689"  # 楓星字型容易混淆的數字（OCR 後處理修正用）
+
+# 每個數字 → 可能被讀成的其他數字（pair-wise 防止全集合互換造成過度修正）
+CONFUSION_MAP = {
+    '0': ['8'],
+    '3': ['5', '8', '9'],
+    '5': ['3', '6'],          # 楓星字型 5/6 經常混淆
+    '6': ['5', '8', '9'],     # 6 上下顛倒像 8、像 9
+    '8': ['0', '3', '6', '9'],
+    '9': ['3', '6', '8'],
+}
+
 MAX_OVER_CAP_RATIO = 1.02
 MIN_DELTA = 50_000
 PROGRESS_TOLERANCE_RATIO = 0.025
@@ -74,10 +85,14 @@ def correct_confused_689(raw: int, pct: Optional[float], ctx: Context):
         if flip_count > len(positions):
             break
         for flip_positions in itertools.combinations(positions, flip_count):
+            # 每個位置只翻成「真的容易被讀錯成的數字」（pair-wise），不全集合亂試
             options = [
-                [d for d in CONFUSED_DIGITS if d != raw_digits[i]]
+                CONFUSION_MAP.get(raw_digits[i], [])
                 for i in flip_positions
             ]
+            # 任何一位沒可翻選項就跳過
+            if any(not o for o in options):
+                continue
             for replacements in itertools.product(*options):
                 new_digits = raw_digits.copy()
                 changes = []
@@ -95,7 +110,7 @@ def correct_confused_689(raw: int, pct: Optional[float], ctx: Context):
 
     if best is None:
         return None
-    return best[2], pct, f"6/8/9 修正（{', '.join(best[3])}）"
+    return best[2], pct, f"相似數字修正（{', '.join(best[3])}）"
 
 
 def correct_inserted_digit(raw: int, pct: Optional[float], ctx: Context):
@@ -168,10 +183,46 @@ def correct_backward(raw: int, pct: Optional[float], ctx: Context):
     return None  # 預留位置；複雜的回退邏輯放 tracker 層
 
 
+def correct_pct_from_raw(raw: int, pct: Optional[float], ctx: Context):
+    """
+    pct 從 raw 反推 — OCR 把 9 讀成 8 之類的 pct 錯誤
+    
+    用 manual_level + raw 推算 pct = raw / cap × 100
+    比 OCR 文字 pct 還準（OCR 對 6/8/9 經常混淆）
+    
+    保護機制（必須全部通過才介入）：
+    1. 有 manual_level
+    2. raw 在合理範圍內（0 ≤ raw ≤ cap × 1.02）
+    3. OCR pct 跟反推 pct 差 > 2%（避免精度噪音的無謂修改）
+    4. **raw/cap 跟 visual_pct 一致**（差 < 3%）— 確認 raw 是對的才能用來反推
+       這道擋住：raw 也讀錯時，不要用錯的 raw 推出更錯的 pct
+    """
+    if ctx.reference_cap is None or raw is None:
+        return None
+    cap = ctx.reference_cap
+    # 條件 2：raw 必須在合理範圍
+    if raw < 0 or raw > cap * MAX_OVER_CAP_RATIO:
+        return None
+    pct_from_raw = raw / cap * 100
+    # 條件 3：OCR pct 跟反推差太小就不動
+    if pct is not None and abs(pct - pct_from_raw) <= 2.0:
+        return None
+    # 條件 4：raw 必須跟視覺進度條一致才能信任
+    # 沒 visual_pct → 不修（不確定 raw 對不對）
+    if ctx.visual_pct is None:
+        return None
+    if abs(pct_from_raw - ctx.visual_pct) > 3.0:
+        # raw/cap 跟 visual 不一致 → raw 可能也錯了，不能用來反推
+        return None
+    # 通過所有檢查：信任 raw，替換 pct
+    return raw, round(pct_from_raw, 2), "pct 用 raw/cap 反推"
+
+
 DEFAULT_PIPELINE: list[Corrector] = [
     correct_inserted_digit,
     correct_missing_prefix,
     correct_confused_689,
+    correct_pct_from_raw,  # 最後一道：raw 確定後重算 pct
 ]
 
 

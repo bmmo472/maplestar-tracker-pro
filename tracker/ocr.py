@@ -89,6 +89,18 @@ def last_error() -> str:
     return _STATE.error
 
 
+def gpu_available() -> bool:
+    """偵測當前 paddle 是否編譯有 CUDA 支援且能找到 GPU。"""
+    try:
+        import paddle
+        if not paddle.is_compiled_with_cuda():
+            return False
+        # 進一步確認真的有可用 GPU
+        return paddle.device.cuda.device_count() > 0
+    except Exception:
+        return False
+
+
 def init_engine(use_gpu: bool = False) -> bool:
     """顯式初始化引擎。首次呼叫會載模型，可能耗 3–8 秒。"""
     if _STATE.engine is not None:
@@ -113,6 +125,9 @@ def init_engine(use_gpu: bool = False) -> bool:
         "text_det_thresh": 0.1,
         "text_det_box_thresh": 0.1,
         "text_det_unclip_ratio": 1.5,
+        # detection 輸入長邊限制。1920 給 upscale 後的小 ROI 留足夠像素
+        # （547x23 upscale 4x = 2188x92，1920 縮到 1920x80 仍清晰；
+        # 之前 960 會縮到 960x40 導致漏字）
         "text_det_limit_side_len": 1920,
         "text_det_limit_type": "max",
     }
@@ -250,27 +265,20 @@ def recognize_level(image: Image.Image) -> Optional[int]:
 
     回傳 1-300 之間的整數，失敗回 None。
     多候選圖跑 OCR 後投票，取最常見的合理值。
+    為了省 CPU，先只跑原圖；若沒結果再 fallback 跑 1 張灰階變體。
     """
     if _STATE.engine is None and not init_engine():
         return None
 
-    from PIL import ImageOps  # 延後 import，沒呼叫此函數時不負擔
-
-    # 等級數字比 EXP 短，多嘗試前處理變體提高命中率
     base_rgb = image.convert("RGB")
-    candidates = [
-        ("orig", base_rgb),
-        ("gray", base_rgb.convert("L").convert("RGB")),
-        ("invert", ImageOps.invert(base_rgb)),
-    ]
 
-    found_levels: list[int] = []
-    for label, img in candidates:
+    def _run_ocr(img) -> list[int]:
+        levels: list[int] = []
         try:
             prepared = upscale_for_ocr(img)
             result = _STATE.engine.predict(np.array(prepared))  # type: ignore[union-attr]
         except Exception:
-            continue
+            return levels
         for page in (result or []):
             try:
                 data = dict(page)
@@ -289,7 +297,15 @@ def recognize_level(image: Image.Image) -> Optional[int]:
                     except ValueError:
                         continue
                     if 1 <= lvl <= 300:
-                        found_levels.append(lvl)
+                        levels.append(lvl)
+        return levels
+
+    # 第一遍：只跑原圖
+    found_levels = _run_ocr(base_rgb)
+    # 沒讀到 → fallback 灰階再跑一次
+    if not found_levels:
+        gray = base_rgb.convert("L").convert("RGB")
+        found_levels = _run_ocr(gray)
 
     if not found_levels:
         return None

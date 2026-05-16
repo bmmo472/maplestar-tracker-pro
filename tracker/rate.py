@@ -43,6 +43,12 @@ class RateEngine:
         self._windows = windows
         self._samples: deque[Sample] = deque()
         self._session_start: Optional[float] = None
+        # 暫停補償：累計停止期間長度，effective_elapsed 會扣掉
+        self._paused_duration: float = 0.0
+        self._pause_start: Optional[float] = None  # 目前是否在暫停中
+        # interval cache — pause/resume 邊界區間可能落在暫停期間取不到值
+        # 用 cache 保持顯示「上一個有效鎖定值」直到新區間有真實累積
+        self._interval_cache: dict[int, int] = {}
 
     @property
     def windows(self) -> tuple[int, ...]:
@@ -54,6 +60,32 @@ class RateEngine:
             return 0.0
         return time.time() - self._session_start
 
+    def effective_elapsed(self, now: Optional[float] = None) -> float:
+        """
+        有效追蹤秒數 = wall clock elapsed - 累計暫停時長。
+
+        所有「跨界鎖定」相關計算都用這個，不會被停止期間誤導。
+        """
+        if self._session_start is None:
+            return 0.0
+        now = now if now is not None else time.time()
+        elapsed = now - self._session_start - self._paused_duration
+        # 如果目前正在暫停中，再扣掉這次的累積
+        if self._pause_start is not None:
+            elapsed -= (now - self._pause_start)
+        return max(0.0, elapsed)
+
+    def pause(self) -> None:
+        """通知 engine 進入暫停狀態。"""
+        if self._pause_start is None:
+            self._pause_start = time.time()
+
+    def resume(self) -> None:
+        """通知 engine 恢復追蹤，把這段暫停加進累計。"""
+        if self._pause_start is not None:
+            self._paused_duration += time.time() - self._pause_start
+            self._pause_start = None
+
     @property
     def total_gained(self) -> int:
         if not self._samples:
@@ -63,6 +95,9 @@ class RateEngine:
     def reset(self) -> None:
         self._samples.clear()
         self._session_start = None
+        self._paused_duration = 0.0
+        self._pause_start = None
+        self._interval_cache.clear()
 
     def start_session(self) -> None:
         if self._session_start is None:
@@ -138,35 +173,40 @@ class RateEngine:
         return None
 
     def _gained_at(self, target_t: float) -> Optional[int]:
-        """在 samples 中找最接近且 <= target_t 的 total_gained 值。"""
+        """
+        找最接近 target_t 的樣本 total_gained。
+        優先取 <= target_t 的最近者；若沒有就取最早一筆（避免回 None）。
+        """
         if not self._samples:
             return None
         best: Optional[int] = None
+        best_t: Optional[float] = None
         for t, g in self._samples:
             if t <= target_t:
                 best = g
+                best_t = t
             else:
+                # 已超過 target，看是否「比上一筆更接近」
+                if best is None:
+                    # target 在第一筆樣本之前 → 用最早樣本
+                    return g
+                # 否則用上一筆（已在 best）
                 break
         return best
 
     def interval_accumulated(self, window_seconds: int,
                              now: Optional[float] = None) -> Optional[int]:
         """
-        最近一個完整 N 秒區間的累積 EXP。
+        最近一個完整 N 秒區間的累積 EXP（用有效追蹤時長，扣除暫停期間）。
 
-        以 session_start 為原點切區間：[0,W], [W,2W], [2W,3W]...
         - elapsed < W：第一個區間還沒過完，回 session start 到現在的累積
         - elapsed >= W：永遠回**最近一個完整區間**的累積值（不會被「進行中」覆蓋）
-
-        例如 5 分鐘區間：
-        - t=300s 第 1 區間完成累積 3M  → 顯示 3M
-        - t=400s 第 2 區間進行中       → 還是顯示 3M（鎖定）
-        - t=600s 第 2 區間完成累積 2.5M → 顯示 2.5M
         """
         if self._session_start is None or not self._samples:
             return None
         now = now if now is not None else time.time()
-        elapsed = now - self._session_start
+        # 用有效追蹤時長切區間，停止期間不算
+        elapsed = self.effective_elapsed(now=now)
         if elapsed <= 0:
             return None
         if elapsed < window_seconds:
@@ -176,10 +216,22 @@ class RateEngine:
         full_count = int(elapsed // window_seconds)
         end_offset = full_count * window_seconds
         start_offset = end_offset - window_seconds
-        start_t = self._session_start + start_offset
-        end_t = self._session_start + end_offset
+        # 把有效時長轉回 wall clock 時間
+        # 注意：只加「已完成的暫停」，不加進行中的暫停
+        # （進行中暫停會讓區間落在沒樣本期間導致顯示 0）
+        wall_offset = self._paused_duration
+        start_t = self._session_start + start_offset + wall_offset
+        end_t = self._session_start + end_offset + wall_offset
         start_g = self._gained_at(start_t)
         end_g = self._gained_at(end_t)
         if start_g is None or end_g is None:
-            return None
-        return max(0, int(end_g - start_g))
+            # 沒樣本 fallback cache
+            return self._interval_cache.get(window_seconds)
+        result = max(0, int(end_g - start_g))
+        # 如果結果 > 0 更新 cache（pause 期間區間會算到 0，那時用 cache 保持上次值）
+        if result > 0:
+            self._interval_cache[window_seconds] = result
+            return result
+        # 結果 0：可能是真的沒打怪、或區間落在 paused 期間
+        # 有 cache 就用 cache，沒 cache 就回 0
+        return self._interval_cache.get(window_seconds, 0)

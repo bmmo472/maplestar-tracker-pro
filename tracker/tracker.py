@@ -30,9 +30,11 @@ LEVEL_RESET_CONFIRM_SAMPLES = 2
 PCT_VISUAL_MISMATCH_TOLERANCE = 3.0
 BASELINE_CONFIRM_DIGIT_MATCH = True
 MEDIAN_FILTER_SIZE = 3
-CONSENSUS_SAMPLES = 5         # 累積 5 筆 OCR 才檢查共識
-CONSENSUS_WINDOW_S = 5.0      # 至少 5 秒才 commit 一次
-CONSENSUS_SPREAD_RATIO = 0.001  # 共識：中央 3 筆 spread 須 < 0.1% raw 值
+CONSENSUS_SAMPLES = 3         # 累積 3 筆 OCR 才檢查共識（從 5 縮短，反應更快）
+CONSENSUS_WINDOW_S = 2.0      # 至少 2 秒才 commit 一次（從 3 秒縮短）
+CONSENSUS_SPREAD_RATIO = 0.005  # 共識：spread 須 < 0.5% raw 值
+CONSENSUS_SPREAD_MIN = 30000  # 絕對下限 30K（從 10K 放寬，配合快打怪每秒 30K+ 增量）
+CONSENSUS_MAX_FAILS = 3       # 連續 N 次共識失敗強制 commit median（避免雪崩）
 
 
 @dataclass
@@ -84,8 +86,11 @@ class Tracker:
         self._lock = threading.RLock()
         self.rate_engine = RateEngine()
         self.pending = PendingState()
-        self._last_raw: Optional[int] = None
+        self._last_raw: Optional[int] = None     # 上次 commit 後的 raw（給 delta 計算用）
         self._last_pct: Optional[float] = None
+        # UI 顯示用 — 每筆 OCR 都更新（即時反應，不等共識）
+        self._display_raw: Optional[int] = None
+        self._display_pct: Optional[float] = None
         self._manual_level: Optional[int] = None
         self._level_cap: Optional[int] = None
         self._level_auto_detected: bool = False  # 該等級是自動偵測的
@@ -100,8 +105,9 @@ class Tracker:
         # OCR 抖動抑制（單筆雜訊）
         self._raw_filter_buf: deque[int] = deque(maxlen=MEDIAN_FILTER_SIZE)
         # 5 秒共識緩衝（commit 用）— 存 (t, raw, pct, visual_pct)
-        self._consensus_buf: deque = deque(maxlen=CONSENSUS_SAMPLES * 2)
+        self._consensus_buf: deque = deque(maxlen=CONSENSUS_SAMPLES)
         self._last_commit_at: float = 0.0
+        self._consensus_fail_count: int = 0      # 連續共識失敗次數
 
     # ===== 公開 read-only properties =====
     @property
@@ -131,13 +137,15 @@ class Tracker:
 
     @property
     def last_raw(self) -> Optional[int]:
+        """給 UI 顯示用 — 每筆 OCR 都更新，不等共識。"""
         with self._lock:
-            return self._last_raw
+            return self._display_raw if self._display_raw is not None else self._last_raw
 
     @property
     def last_pct(self) -> Optional[float]:
+        """給 UI 顯示用 — 每筆 OCR 都更新，不等共識。"""
         with self._lock:
-            return self._last_pct
+            return self._display_pct if self._display_pct is not None else self._last_pct
 
     @property
     def last_status(self) -> SampleStatus:
@@ -182,6 +190,9 @@ class Tracker:
             self._raw_filter_buf.clear()
             self._consensus_buf.clear()
             self._last_commit_at = 0.0
+            self._consensus_fail_count = 0
+            self._display_raw = None
+            self._display_pct = None
 
     def set_manual_level(self, level: Optional[int]) -> None:
         with self._lock:
@@ -259,10 +270,24 @@ class Tracker:
             raw, pct = corr.raw, corr.pct
             status.corrections = corr.reasons
 
+            # === Bug D 防護：corrector 之後 raw 仍為 None 直接忽略 ===
+            if raw is None:
+                self._ignored_count += 1
+                status.state = "未讀到 EXP"
+                status.reason = "OCR 修正後無有效讀值"
+                self._last_status = status
+                return status
+
+            # === Bug A 修正：UI 顯示立即更新，不等共識 ===
+            # 給「目前 EXP」即時反應；共識只控制 commit 累積
+            # （之前加 sanity check 反而會 freeze UI，移除）
+            self._display_raw = raw
+            self._display_pct = pct
+
             # 自動偵測等級用最新 raw（每筆都跑）
             self._try_auto_detect_level(raw, pct)
 
-            # === 5 秒共識門檻 ===
+            # === 5 秒共識門檻（僅控制 commit，不影響 UI 顯示） ===
             # 累積 5 筆 OCR 後檢查共識，不通過整批丟棄等下輪
             # 寧可慢一點，但累積要準
             self._consensus_buf.append((t, raw, pct, ocr_result.visual_pct))
@@ -271,10 +296,12 @@ class Tracker:
             if need_samples or need_time:
                 have = min(len(self._consensus_buf), CONSENSUS_SAMPLES)
                 status.state = f"收集樣本 {have}/{CONSENSUS_SAMPLES}"
+                status.raw_after = raw  # UI 顯示用
+                status.pct_after = pct
                 self._last_status = status
                 return status
 
-            # 取最近 5 筆，排序後去頭去尾取中央 3 筆檢查 spread
+            # 取最近 N 筆排序檢查 spread（3 筆時直接 max-min，5+ 筆才去頭去尾）
             recent = list(self._consensus_buf)[-CONSENSUS_SAMPLES:]
             raws_valid = [r[1] for r in recent if r[1] is not None]
             if len(raws_valid) < CONSENSUS_SAMPLES:
@@ -283,20 +310,34 @@ class Tracker:
                 return status
 
             raws_sorted = sorted(raws_valid)
-            middle = raws_sorted[1:-1]
-            spread = middle[-1] - middle[0]
-            median_raw = middle[len(middle) // 2]
-            spread_threshold = max(int(median_raw * CONSENSUS_SPREAD_RATIO), 5000)
+            if len(raws_sorted) >= 5:
+                # 5+ 筆：去頭去尾取中央 3 筆 spread（抗離群值更強）
+                middle = raws_sorted[1:-1]
+                spread = middle[-1] - middle[0]
+                median_raw = middle[len(middle) // 2]
+            else:
+                # 3-4 筆：直接 spread = max - min, median 取中位數
+                spread = raws_sorted[-1] - raws_sorted[0]
+                median_raw = raws_sorted[len(raws_sorted) // 2]
+            spread_threshold = max(int(median_raw * CONSENSUS_SPREAD_RATIO),
+                                   CONSENSUS_SPREAD_MIN)
 
             if spread > spread_threshold:
-                self._ignored_count += 1
-                status.state = "樣本驗證中"
-                status.reason = f"5 筆中央 spread {spread:,} > 容忍 {spread_threshold:,}"
-                self._last_status = status
-                # 不重置 buf，繼續往下累積，等下次共識
-                return status
+                # Bug B 修正：連續失敗計數，超過 MAX 強制 commit median 避免雪崩
+                self._consensus_fail_count += 1
+                if self._consensus_fail_count < CONSENSUS_MAX_FAILS:
+                    self._ignored_count += 1
+                    status.state = "樣本驗證中"
+                    status.reason = (f"{len(raws_sorted)} 筆 spread {spread:,} > 容忍 {spread_threshold:,}"
+                                     f" (失敗 {self._consensus_fail_count}/{CONSENSUS_MAX_FAILS})")
+                    self._last_status = status
+                    return status
+                # 連續失敗達上限：強制採用 median + 重置計數 + 清 buffer
+                self._consensus_buf.clear()
+                # 不 return，往下走採用 median raw
 
-            # 共識成立 — 用 median raw / median pct / median visual_pct
+            # 共識成立（或強制採用）— 用 median raw / median pct / median visual_pct
+            self._consensus_fail_count = 0
             raw = median_raw
             pcts_sorted = sorted([r[2] for r in recent if r[2] is not None])
             if pcts_sorted:
@@ -522,21 +563,21 @@ class Tracker:
 
     def _is_suspicious_jump(self, delta: int, raw: int, pct: Optional[float],
                             visual_pct: Optional[float]) -> bool:
-        # 第一道：沒設等級時用「相對於目前 raw 的比例」防爆
-        # baseline 早期 OCR 讀錯成小數字、後續穩定讀到正確大數字時會觸發
-        if self._level_cap is None:
-            if raw > 0 and delta > raw * 0.30:
-                return True
-            return False
-        cap = self._level_cap
-        if delta > cap * 0.5:  # 一筆跳超過 50% 等級
+        # 第一道（永遠檢查）：delta 接近 raw 一定是 baseline 早期讀錯
+        # 例如 baseline OCR 讀到 1234，下一筆讀到 3,780,000，delta 99% 來自基準偏差
+        if raw > 0 and delta > raw * 0.30:
             return True
-        # pct 變化跟 delta 對不上
-        if pct is not None and self._last_pct is not None:
-            expected_pct_delta = delta / cap * 100
-            actual_pct_delta = pct - self._last_pct
-            if abs(actual_pct_delta - expected_pct_delta) > 5.0:
+        # 有等級時加第二、三道
+        if self._level_cap is not None:
+            cap = self._level_cap
+            if delta > cap * 0.5:  # 一筆跳超過 50% 等級
                 return True
+            # pct 變化跟 delta 對不上
+            if pct is not None and self._last_pct is not None:
+                expected_pct_delta = delta / cap * 100
+                actual_pct_delta = pct - self._last_pct
+                if abs(actual_pct_delta - expected_pct_delta) > 5.0:
+                    return True
         return False
 
     def _confirm_jump(self, raw: int, t: float) -> bool:
